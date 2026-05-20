@@ -6,9 +6,11 @@
 
 set -o pipefail 2>/dev/null || true
 
+ADR_VERSION="1.0"
 USE_AI=0
 SKIP_MANUAL=0
 SKIP_AGENT_SCAN=0
+LAUNCH_GUI=0
 OUTPUT_DIR=""
 AI_PROVIDER=""
 AI_MODEL=""
@@ -18,7 +20,7 @@ ENV_FILE_STATUS=""
 
 usage() {
     cat <<'USAGE'
-Usage: ./adr.sh [--ai] [--ai-provider PROVIDER] [--ai-model MODEL] [--ai-endpoint URL] [--env-file FILE] [--output-dir DIR] [--skip-manual]
+Usage: ./adr.sh [--ai] [--ai-provider PROVIDER] [--ai-model MODEL] [--ai-endpoint URL] [--env-file FILE] [--output-dir DIR] [--skip-manual] [--gui]
 
 Options:
   --ai              Add optional AI research suggestions.
@@ -35,6 +37,7 @@ Options:
                     Also controlled by ADR_SKIP_MANUAL_CHECKS=true in adr.env.
   --skip-agent-scan Skip the remote agent scan Y/N prompt entirely.
                     Also controlled by ADR_SKIP_AGENT_SCAN=true in adr.env.
+  --gui             Launch the ADR graphical launcher (requires Python 3 + tkinter).
   -h, --help        Show this help.
 USAGE
 }
@@ -94,6 +97,9 @@ while [ "$#" -gt 0 ]; do
         --skip-agent-scan)
             SKIP_AGENT_SCAN=1
             ;;
+        --gui)
+            LAUNCH_GUI=1
+            ;;
         *)
             echo "Unknown option: $1" >&2
             usage >&2
@@ -116,6 +122,28 @@ mkdir -p "$OUTPUT_DIR" || {
     echo "Unable to create output directory: $OUTPUT_DIR" >&2
     exit 1
 }
+
+# ── GUI launch (--gui flag) ────────────────────────────────────────────────────
+if [ "$LAUNCH_GUI" = "1" ]; then
+    _gui_script="$SCRIPT_DIR/adr_gui.py"
+    _python=""
+    for _py in python3 python; do
+        if command -v "$_py" >/dev/null 2>&1; then
+            _python="$_py"
+            break
+        fi
+    done
+    if [ -z "$_python" ]; then
+        printf 'Error: Python 3 is required to launch the ADR GUI.\n' >&2
+        printf 'Install Python 3 (python.org) and try again.\n' >&2
+        exit 1
+    fi
+    if [ ! -f "$_gui_script" ]; then
+        printf 'Error: adr_gui.py not found at %s\n' "$_gui_script" >&2
+        exit 1
+    fi
+    exec "$_python" "$_gui_script"
+fi
 
 have() {
     command -v "$1" >/dev/null 2>&1
@@ -1009,6 +1037,39 @@ get_remote_agents() {
     [ -n "$proc_hits" ] && printf 'Agent-related running processes: %s\n' "$proc_hits"
 }
 
+print_adr_banner() {
+    local c_cyan c_bold c_dim c_reset
+    if [ -t 1 ]; then
+        c_cyan=$(printf '\033[36m')
+        c_bold=$(printf '\033[1m')
+        c_dim=$(printf '\033[2m')
+        c_reset=$(printf '\033[0m')
+    fi
+    printf '%s\n' "${c_cyan}╔══════════════════════════════════════════════════════════╗${c_reset}"
+    printf '%s\n' "${c_cyan}║${c_reset}                                                          ${c_cyan}║${c_reset}"
+    printf '%s\n' "${c_cyan}║${c_reset}  ${c_bold}   ___    ____   ____  ${c_reset}                                  ${c_cyan}║${c_reset}"
+    printf '%s\n' "${c_cyan}║${c_reset}  ${c_bold}  / _ \  |  _ \ |  _ \ ${c_reset}                                 ${c_cyan}║${c_reset}"
+    printf '%s\n' "${c_cyan}║${c_reset}  ${c_bold} | |_| | | | | || |_) |${c_reset}                                 ${c_cyan}║${c_reset}"
+    printf '%s\n' "${c_cyan}║${c_reset}  ${c_bold} |  _  | | |_| ||  _ < ${c_reset}                                 ${c_cyan}║${c_reset}"
+    printf '%s\n' "${c_cyan}║${c_reset}  ${c_bold} |_| |_| |____/ |_| \_\ ${c_reset}                                ${c_cyan}║${c_reset}"
+    printf '%s\n' "${c_cyan}║${c_reset}                                                          ${c_cyan}║${c_reset}"
+    printf '%s\n' "${c_cyan}║${c_reset}  ${c_bold}Automated Diagnostic Report${c_reset}         v${ADR_VERSION}            ${c_cyan}║${c_reset}"
+    printf '%s\n' "${c_cyan}║${c_reset}  ${c_dim}Written by Connor Remsen${c_reset}                               ${c_cyan}║${c_reset}"
+    printf '%s\n' "${c_cyan}║${c_reset}                                                          ${c_cyan}║${c_reset}"
+    printf '%s\n' "${c_cyan}╚══════════════════════════════════════════════════════════╝${c_reset}"
+    printf '\n'
+}
+
+adr_status() {
+    local c_cyan c_bold c_reset
+    if [ -t 1 ]; then
+        c_cyan=$(printf '\033[36m')
+        c_bold=$(printf '\033[1m')
+        c_reset=$(printf '\033[0m')
+    fi
+    printf '  %s→%s  %s\n' "${c_cyan}${c_bold}" "${c_reset}" "$1"
+}
+
 approx_age_from_bios_date() {
     date_value=$1
     if [ -z "$date_value" ] || printf '%s' "$date_value" | grep -qi '^Unavailable'; then
@@ -1027,6 +1088,7 @@ approx_age_from_bios_date() {
     fi
 }
 
+print_adr_banner
 load_env_file "$ENV_FILE"
 
 HOST_NAME=$(hostname 2>/dev/null || uname -n 2>/dev/null || printf '%s\n' UNKNOWN)
@@ -1036,9 +1098,11 @@ TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 # Determine UNAME_S early so launch_manual_gui can test it
 UNAME_S=$(uname -s 2>/dev/null || printf '%s\n' Unknown)
 
+adr_status "Launching manual hardware check GUI..."
 launch_manual_gui
 
 # ── Root drive anomaly check (always runs, lightweight) ────────────────────
+adr_status "Scanning root drive for unexpected files..."
 ROOT_DRIVE_ANOMALIES=$(get_root_drive_anomalies)
 
 # ── Remote agent scan (optional — Y/N prompt unless skipped) ───────────────
@@ -1111,6 +1175,7 @@ MIC_USAGE="Unavailable: no data returned"
 CAMERA_USAGE="Unavailable: no data returned"
 MDM_STATUS="Unavailable: no data returned"
 
+adr_status "Collecting hardware and system data..."
 if [ "$UNAME_S" = "Darwin" ]; then
     HW_PROFILE=$(system_profiler SPHardwareDataType 2>/dev/null)
     POWER_PROFILE=$(system_profiler SPPowerDataType 2>/dev/null)
@@ -1425,6 +1490,7 @@ else
     SERIAL="Unavailable: unsupported OS for this script"
 fi
 
+adr_status "Compiling diagnostic report..."
 FACT_TEXT=$(cat <<EOF
 GeneratedAt: $GENERATED_AT
 Host: $HOST_NAME
@@ -1468,11 +1534,14 @@ AI_PROVIDER_RESOLVED=""
 AI_MODEL_RESOLVED=""
 AI_ENDPOINT_RESOLVED=""
 if [ "$USE_AI" = "1" ]; then
+    adr_status "Requesting AI research suggestions..."
     AI_PROVIDER_RESOLVED=$(resolve_ai_provider)
     AI_MODEL_RESOLVED=$(resolve_ai_model "$AI_PROVIDER_RESOLVED")
     AI_ENDPOINT_RESOLVED=$(resolve_ai_endpoint "$AI_PROVIDER_RESOLVED" "$AI_MODEL_RESOLVED")
     AI_RESULT=$(call_ai_enrichment "$AI_PROVIDER_RESOLVED" "$AI_MODEL_RESOLVED" "$AI_ENDPOINT_RESOLVED" "$FACT_TEXT")
 fi
+
+adr_status "Writing report to disk..."
 
 emit_section() {
     title=$1

@@ -23,8 +23,14 @@ import tkinter as tk
 from tkinter import ttk
 
 # ── Platform ──────────────────────────────────────────────────────────────────
-PLATFORM   = sys.platform                                    # win32 | darwin | linux
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PLATFORM = sys.platform  # win32 | darwin | linux
+
+# When frozen by PyInstaller the executable lives beside the ADR scripts;
+# use sys.executable's directory so it finds adr.ps1 / adr.sh next to it.
+if getattr(sys, "frozen", False):
+    SCRIPT_DIR = os.path.dirname(sys.executable)
+else:
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 BACKEND = (
     os.path.join(SCRIPT_DIR, "adr.ps1") if PLATFORM == "win32"

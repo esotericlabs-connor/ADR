@@ -1,0 +1,190 @@
+name: Build Executables
+
+# Triggers: push a tag like v1.0 for a full release, or run manually via Actions tab.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to create GitHub Releases
+
+jobs:
+  # ── Windows ────────────────────────────────────────────────────────────────
+  build-windows:
+    name: Windows EXE
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyInstaller
+        run: pip install pyinstaller
+
+      - name: Build ADR.exe
+        run: |
+          pyinstaller `
+            --onefile `
+            --windowed `
+            --name ADR `
+            src/adr_gui.py
+
+      - name: Bundle release zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path release-windows -Force
+          Copy-Item dist\ADR.exe          release-windows\
+          Copy-Item src\adr.ps1           release-windows\
+          Copy-Item src\adr_checks.py     release-windows\
+          Copy-Item src\adr.env.example   release-windows\
+          Compress-Archive -Path release-windows\* -DestinationPath ADR-Windows.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ADR-Windows
+          path: ADR-Windows.zip
+
+  # ── Linux AppImage ─────────────────────────────────────────────────────────
+  build-linux:
+    name: Linux AppImage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y python3-tk python3-dev libfuse2
+
+      - name: Install PyInstaller
+        run: pip install pyinstaller
+
+      - name: Build Linux binary
+        run: |
+          pyinstaller \
+            --onedir \
+            --name ADR \
+            src/adr_gui.py
+
+      - name: Create AppImage
+        run: |
+          # ── AppDir skeleton ──────────────────────────────────────────────
+          mkdir -p AppDir/usr/bin
+          cp -r dist/ADR/* AppDir/usr/bin/
+          mv AppDir/usr/bin/ADR AppDir/usr/bin/.ADR_bin   # keep binary inside /usr/bin
+
+          # ── AppRun (entry point) ─────────────────────────────────────────
+          cat > AppDir/AppRun << 'APPRUN'
+          #!/bin/bash
+          APPDIR="$(dirname "$(readlink -f "$0")")"
+          exec "$APPDIR/usr/bin/.ADR_bin" "$@"
+          APPRUN
+          chmod +x AppDir/AppRun
+
+          # ── Desktop entry ────────────────────────────────────────────────
+          cat > AppDir/ADR.desktop << 'DESKTOP'
+          [Desktop Entry]
+          Name=ADR
+          Comment=Automated Diagnostic Report
+          Exec=ADR
+          Icon=ADR
+          Type=Application
+          Categories=System;Utility;
+          DESKTOP
+
+          # ── Minimal icon (solid navy 256×256 PNG via Python stdlib) ──────
+          python3 - << 'PYICON'
+          import struct, zlib
+          def png(w, h, r, g, b):
+              def chunk(t, d):
+                  c = t + d
+                  return struct.pack('>I', len(d)) + c + struct.pack('>I', zlib.crc32(c) & 0xFFFFFFFF)
+              raw = b''.join(b'\x00' + bytes([r,g,b])*w for _ in range(h))
+              return (b'\x89PNG\r\n\x1a\n'
+                      + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0))
+                      + chunk(b'IDAT', zlib.compress(raw))
+                      + chunk(b'IEND', b''))
+          open('AppDir/ADR.png', 'wb').write(png(256, 256, 26, 35, 50))
+          PYICON
+
+          # ── Download appimagetool ─────────────────────────────────────────
+          wget -q https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool-x86_64.AppImage
+
+          # ── Build AppImage ────────────────────────────────────────────────
+          ARCH=x86_64 ./appimagetool-x86_64.AppImage AppDir ADR-x86_64.AppImage
+
+      - name: Bundle release zip
+        run: |
+          mkdir release-linux
+          cp ADR-x86_64.AppImage  release-linux/
+          cp src/adr.sh           release-linux/
+          cp src/adr_checks.py    release-linux/
+          cp src/adr.env.example  release-linux/
+          chmod +x release-linux/adr.sh
+          zip -r ADR-Linux.zip release-linux/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ADR-Linux
+          path: ADR-Linux.zip
+
+  # ── GitHub Release (tags only) ─────────────────────────────────────────────
+  release:
+    name: Publish Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build-windows, build-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ADR-Windows
+          path: artifacts/
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ADR-Linux
+          path: artifacts/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "ADR ${{ github.ref_name }}"
+          body: |
+            ## ADR — Automated Diagnostic Report ${{ github.ref_name }}
+
+            ### Downloads
+
+            | Platform | File | Notes |
+            |----------|------|-------|
+            | Windows | `ADR-Windows.zip` | Extract zip, run `ADR.exe` |
+            | Linux   | `ADR-Linux.zip`   | Extract zip, run `ADR-x86_64.AppImage` |
+            | macOS   | *(use `bash adr.sh`)* | No packaged binary yet |
+
+            ### Contents of each zip
+            - **ADR.exe / ADR-x86_64.AppImage** — GUI launcher
+            - **adr.ps1 / adr.sh** — CLI scripts (place next to the executable)
+            - **adr_checks.py** — manual hardware checks helper
+            - **adr.env.example** — copy to `adr.env` and add API keys
+
+            ### CLI usage
+            ```powershell
+            # Windows PowerShell
+            .\adr.ps1 [--gui | -UseAiEnrichment | -SkipManualChecks]
+
+            # macOS / Linux
+            bash adr.sh [--gui | --ai | --skip-manual]
+            ```
+          files: |
+            artifacts/ADR-Windows.zip
+            artifacts/ADR-Linux.zip
+          draft: false
+          prerelease: false

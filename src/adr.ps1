@@ -52,11 +52,87 @@ param(
     [string]$EnvFile,
     [string]$OutputDirectory,
     [switch]$SkipManualChecks,
-    [switch]$SkipAgentScan
+    [switch]$SkipAgentScan,
+    [switch]$Gui
 )
 
 $ErrorActionPreference = "Continue"
 $ProgressPreference = "SilentlyContinue"
+
+$script:AdrVersion = "1.0"
+
+# ── GUI launch (-Gui flag) ─────────────────────────────────────────────────────
+if ($Gui.IsPresent) {
+    $guiScript = Join-Path $PSScriptRoot "adr_gui.py"
+    $python = (Get-Command python3 -ErrorAction SilentlyContinue) ?? (Get-Command python -ErrorAction SilentlyContinue)
+    if (-not $python) {
+        Write-Host "Error: Python 3 is required to launch the ADR GUI." -ForegroundColor Red
+        Write-Host "Install Python 3 from python.org and try again." -ForegroundColor Red
+        exit 1
+    }
+    if (-not (Test-Path -LiteralPath $guiScript)) {
+        Write-Host "Error: adr_gui.py not found at $guiScript" -ForegroundColor Red
+        exit 1
+    }
+    & $python.Source $guiScript
+    exit 0
+}
+
+function Write-AdrBanner {
+    $w = 60
+    $border = '║'
+    $h      = '═'
+    $tl     = '╔'; $tr = '╗'; $bl = '╚'; $br = '╝'
+    $line   = $h * ($w - 2)
+    Write-Host ""
+    Write-Host "$tl$line$tr" -ForegroundColor Cyan
+    Write-Host "$border$(' ' * ($w - 2))$border" -ForegroundColor Cyan
+    Write-Host "$border  " -ForegroundColor Cyan -NoNewline
+    Write-Host "   ___    ____   ____  " -ForegroundColor White -NoNewline
+    Write-Host (' ' * ($w - 27)) -NoNewline
+    Write-Host "$border" -ForegroundColor Cyan
+    Write-Host "$border  " -ForegroundColor Cyan -NoNewline
+    Write-Host "  / _ \  |  _ \ |  _ \ " -ForegroundColor White -NoNewline
+    Write-Host (' ' * ($w - 28)) -NoNewline
+    Write-Host "$border" -ForegroundColor Cyan
+    Write-Host "$border  " -ForegroundColor Cyan -NoNewline
+    Write-Host " | |_| | | | | || |_) |" -ForegroundColor White -NoNewline
+    Write-Host (' ' * ($w - 28)) -NoNewline
+    Write-Host "$border" -ForegroundColor Cyan
+    Write-Host "$border  " -ForegroundColor Cyan -NoNewline
+    Write-Host " |  _  | | |_| ||  _ < " -ForegroundColor White -NoNewline
+    Write-Host (' ' * ($w - 28)) -NoNewline
+    Write-Host "$border" -ForegroundColor Cyan
+    Write-Host "$border  " -ForegroundColor Cyan -NoNewline
+    Write-Host " |_| |_| |____/ |_| \_\" -ForegroundColor White -NoNewline
+    Write-Host (' ' * ($w - 28)) -NoNewline
+    Write-Host "$border" -ForegroundColor Cyan
+    Write-Host "$border$(' ' * ($w - 2))$border" -ForegroundColor Cyan
+    $title = "  Automated Diagnostic Report"
+    $ver   = "v$($script:AdrVersion)"
+    $pad   = $w - 2 - $title.Length - $ver.Length - 2
+    Write-Host "$border" -ForegroundColor Cyan -NoNewline
+    Write-Host $title -ForegroundColor White -NoNewline
+    Write-Host (' ' * $pad) -NoNewline
+    Write-Host $ver -ForegroundColor Cyan -NoNewline
+    Write-Host "  $border" -ForegroundColor Cyan
+    $author = "  Written by Connor Remsen"
+    $apad   = $w - 2 - $author.Length
+    Write-Host "$border" -ForegroundColor Cyan -NoNewline
+    Write-Host $author -ForegroundColor DarkGray -NoNewline
+    Write-Host (' ' * $apad) -NoNewline
+    Write-Host "$border" -ForegroundColor Cyan
+    Write-Host "$border$(' ' * ($w - 2))$border" -ForegroundColor Cyan
+    Write-Host "$bl$line$br" -ForegroundColor Cyan
+    Write-Host ""
+}
+
+function Write-AdrStatus {
+    param([string]$Message)
+    Write-Host "  " -NoNewline
+    Write-Host "→" -ForegroundColor Cyan -NoNewline
+    Write-Host "  $Message"
+}
 
 function Resolve-AdrOutputDirectory {
     param([string]$RequestedDirectory)
@@ -1732,6 +1808,7 @@ function Get-AdrRemoteAgents {
     return $out -join "`n"
 }
 
+Write-AdrBanner
 $envFileStatus = Import-AdrEnvFile -RequestedPath $EnvFile
 $outputDirectoryPath = Resolve-AdrOutputDirectory -RequestedDirectory $OutputDirectory
 $computerName = First-AdrNonBlank @($env:COMPUTERNAME, "UNKNOWN")
@@ -1742,10 +1819,12 @@ $generatedAt = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss zzz")
 $isAdmin = Test-AdrAdmin
 
 $skipManualEnv = ([System.Environment]::GetEnvironmentVariable("ADR_SKIP_MANUAL_CHECKS") -eq "true")
+Write-AdrStatus "Launching manual hardware check GUI..."
 $manualChecks  = Invoke-AdrManualGui -Skip $SkipManualChecks.IsPresent -SkipFromEnv $skipManualEnv `
                                      -HostName $computerName -Timestamp $timestamp
 
 # ── Root drive anomaly check (always runs, lightweight) ────────────────────────
+Write-AdrStatus "Scanning root drive for unexpected files..."
 $rootDriveAnomalies = Get-AdrRootDriveAnomalies
 
 # ── Remote agent scan (optional — Y/N prompt unless skipped by flag or env) ────
@@ -1756,7 +1835,7 @@ if (-not $SkipAgentScan.IsPresent -and -not $skipAgentEnv) {
     Write-Host "Run remote access agent scan? (searches Program Files + services for known agents, computes SHA-256) [Y/n]: " -NoNewline
     try { $agentAns = [Console]::ReadLine() } catch { $agentAns = "y" }
     if ([string]::IsNullOrWhiteSpace($agentAns) -or $agentAns -match "^[Yy]") {
-        Write-Host "Scanning for remote access agents..."
+        Write-AdrStatus "Scanning for remote access agents..."
         $remoteAgentData = Get-AdrRemoteAgents
     }
 }
@@ -1764,6 +1843,7 @@ elseif ($SkipAgentScan.IsPresent -or $skipAgentEnv) {
     $remoteAgentData = "Scan skipped (ADR_SKIP_AGENT_SCAN or -SkipAgentScan flag)"
 }
 
+Write-AdrStatus "Querying hardware and system inventory..."
 $computerSystem = @(Get-AdrCim -ClassName Win32_ComputerSystem) | Select-Object -First 1
 $bios = @(Get-AdrCim -ClassName Win32_BIOS) | Select-Object -First 1
 $baseboard = @(Get-AdrCim -ClassName Win32_BaseBoard) | Select-Object -First 1
@@ -1987,6 +2067,7 @@ $microphoneUsage = Get-AdrCapabilityUsageSummary -Capability "microphone" -Label
 $cameraUsage = Get-AdrCapabilityUsageSummary -Capability "webcam" -Label "Camera"
 $tpmStatus = Get-AdrTpmSummary
 
+Write-AdrStatus "Compiling diagnostic report..."
 $facts = [ordered]@{
     GeneratedAt = $generatedAt
     ComputerName = $computerName
@@ -2203,6 +2284,8 @@ if ($UseAiEnrichment) {
 }
 
 Set-Content -LiteralPath $outputFile -Value $reportLines -Encoding UTF8
+Write-AdrStatus "Writing report to disk..."
+Write-Host ""
 Write-Host "Diagnostic report written to: $outputFile"
 
 if ([System.Environment]::GetEnvironmentVariable("ADR_SES_ENABLED") -eq "true") {
