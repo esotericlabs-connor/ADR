@@ -2,6 +2,14 @@
 
 ADR is a pair of standalone diagnostic scripts for repair shops and MSPs:
 
+<img width="1345" height="912" alt="image" src="https://github.com/user-attachments/assets/418186d0-c35a-4ce9-b115-1b7e398f98b3" />
+
+<img width="1346" height="906" alt="image" src="https://github.com/user-attachments/assets/bc4bc571-804b-4a88-bbec-c2682dc6b944" />
+
+<img width="917" height="196" alt="image" src="https://github.com/user-attachments/assets/c3c33ac5-ee83-47e1-b9e8-87274d3948d8" />
+
+<img width="1342" height="901" alt="image" src="https://github.com/user-attachments/assets/9ada6222-3d12-4d73-89a8-1668783fb1f5" />
+
 - `src/adr.ps1` for Windows.
 - `src/adr.sh` for macOS and Linux.
 
