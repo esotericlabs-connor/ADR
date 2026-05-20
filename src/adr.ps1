@@ -64,7 +64,8 @@ $script:AdrVersion = "1.0"
 # ── GUI launch (-Gui flag) ─────────────────────────────────────────────────────
 if ($Gui.IsPresent) {
     $guiScript = Join-Path $PSScriptRoot "adr_gui.py"
-    $python = (Get-Command python3 -ErrorAction SilentlyContinue) ?? (Get-Command python -ErrorAction SilentlyContinue)
+    $python = Get-Command python3 -ErrorAction SilentlyContinue
+    if (-not $python) { $python = Get-Command python -ErrorAction SilentlyContinue }
     if (-not $python) {
         Write-Host "Error: Python 3 is required to launch the ADR GUI." -ForegroundColor Red
         Write-Host "Install Python 3 from python.org and try again." -ForegroundColor Red

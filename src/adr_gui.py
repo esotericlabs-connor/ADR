@@ -8,6 +8,8 @@ CLI users: run adr.sh (macOS/Linux) or adr.ps1 (Windows) directly.
 
 from __future__ import annotations  # defers annotation evaluation → Python 3.7+ compatible
 
+import base64
+import json
 import math
 import os
 import queue
@@ -17,6 +19,9 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
+import urllib.error
+import urllib.request
 import wave
 from tkinter import BooleanVar, IntVar, StringVar, filedialog, messagebox
 import tkinter as tk
@@ -38,6 +43,9 @@ BACKEND = (
 )
 ENV_FILE    = os.path.join(SCRIPT_DIR, "adr.env")
 ENV_EXAMPLE = os.path.join(SCRIPT_DIR, "adr.env.example")
+
+ADR_VERSION = "1.2"
+GITHUB_REPO = "esotericlabs-connor/ADR"
 
 # ── Fonts ─────────────────────────────────────────────────────────────────────
 _UI   = "Segoe UI"    if PLATFORM == "win32" else ("Helvetica" if PLATFORM == "darwin" else "DejaVu Sans")
@@ -323,6 +331,33 @@ def _make_scrollable(parent: tk.Widget) -> tk.Frame:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Update checker helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _version_tuple(tag: str) -> tuple:
+    """Convert 'v1.2.3' or '1.2.3' to (1, 2, 3) for comparison."""
+    try:
+        return tuple(int(x) for x in tag.lstrip("v").strip().split("."))
+    except ValueError:
+        return (0,)
+
+
+def _is_newer(remote_tag: str, local: str) -> bool:
+    return _version_tuple(remote_tag) > _version_tuple(local)
+
+
+def _is_admin() -> bool:
+    """Return True if the current process has administrator / root privileges."""
+    if PLATFORM != "win32":
+        return os.geteuid() == 0  # type: ignore[attr-defined]
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Main application
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -336,14 +371,23 @@ class AdrApp(tk.Tk):
         self.configure(bg=C["sidebar"])
 
         # Runtime state
-        self._proc:         subprocess.Popen | None = None
-        self._out_q:        queue.Queue             = queue.Queue()
-        self._report_path:  str | None              = None
+        self._proc:               subprocess.Popen | None = None
+        self._out_q:              queue.Queue             = queue.Queue()
+        self._report_path:        str | None              = None
+        self._update_bar:         tk.Frame | None         = None   # injected by _build_home
+
+        # Elevated-run state (Windows UAC path)
+        self._elevated_mode:      bool       = False
+        self._elevated_log_path:  str | None = None
+        self._elevated_log_pos:   int        = 0
+        self._elevated_start:     float      = 0.0
 
         self._init_settings_vars()
         self._build_layout()
         self._load_settings_from_env()
         self._show_page("home")
+        # Delay the network call so the UI is fully rendered first
+        self.after(800, self._start_update_check)
 
     # ── Layout skeleton ───────────────────────────────────────────────────────
 
@@ -399,7 +443,16 @@ class AdrApp(tk.Tk):
             cursor="hand2", activebackground="#15803d", activeforeground="white",
             command=self._start_run,
         )
-        self._sidebar_run.pack(fill="x", padx=14, pady=14)
+        self._sidebar_run.pack(fill="x", padx=14, pady=(14, 4))
+
+        # Support button
+        tk.Button(
+            s, text="☕  Support ADR", font=(_UI, 8),
+            bg=C["sidebar"], fg="#94a3b8", relief="flat",
+            cursor="hand2", pady=6,
+            activebackground=C["sidebar_h"], activeforeground="#ffffff",
+            command=lambda: __import__("webbrowser").open("https://buymeacoffee.com/exoteriklabs"),
+        ).pack(fill="x", padx=14, pady=(0, 10))
 
     def _build_pages(self) -> None:
         self._pages: dict = {}
@@ -438,12 +491,29 @@ class AdrApp(tk.Tk):
 
         # Hero banner
         hero = tk.Frame(pad, bg=C["accent"], padx=28, pady=28)
-        hero.pack(fill="x", pady=(0, 22))
+        hero.pack(fill="x", pady=(0, 0))
         tk.Label(hero, text="ADR — Automated Diagnostic Report",
                  bg=C["accent"], fg="white", font=FONT_H1).pack(anchor="w")
         tk.Label(hero,
                  text="Cross-platform hardware + software diagnostics for IT technicians and MSPs.",
                  bg=C["accent"], fg="#bfdbfe", font=FONT_BODY).pack(anchor="w", pady=(6, 0))
+
+        # Update notification bar (hidden until an update is found)
+        self._update_bar = tk.Frame(pad, bg="#854d0e", padx=20, pady=8)
+        # NOT packed yet — shown by _show_update_bar() when update detected
+        self._update_bar_lbl = tk.Label(
+            self._update_bar, text="", bg="#854d0e", fg="#fef9c3",
+            font=FONT_SMALL, anchor="w",
+        )
+        self._update_bar_lbl.pack(side="left", fill="x", expand=True)
+        self._update_bar_url: str = ""
+        tk.Button(
+            self._update_bar, text="View Release →",
+            font=FONT_SMALL, bg="#ca8a04", fg="white",
+            relief="flat", padx=10, pady=2, cursor="hand2",
+            activebackground="#a16207", activeforeground="white",
+            command=lambda: self._open_update_url(),
+        ).pack(side="right")
 
         # Quick-action cards
         qa = tk.Frame(pad, bg=C["bg"])
@@ -589,7 +659,7 @@ class AdrApp(tk.Tk):
     # ── Subprocess management ─────────────────────────────────────────────────
 
     def _start_run(self) -> None:
-        if self._proc and self._proc.poll() is None:
+        if self._elevated_mode or (self._proc and self._proc.poll() is None):
             messagebox.showwarning("Already running",
                                    "A diagnostic run is already in progress.")
             return
@@ -600,6 +670,24 @@ class AdrApp(tk.Tk):
                 f"Could not find:\n{BACKEND}\n\nEnsure adr_gui.py is in the same folder as the ADR scripts.",
             )
             return
+
+        # On Windows, offer to elevate for complete hardware data
+        if PLATFORM == "win32" and not _is_admin():
+            choice = messagebox.askyesnocancel(
+                "Administrator Access",
+                "Running as Administrator lets ADR collect complete hardware data "
+                "(SMART drive health, detailed memory info, and more).\n\n"
+                "• Yes    — elevate to Administrator  (recommended)\n"
+                "• No     — run as standard user\n"
+                "• Cancel — go back",
+                icon="question",
+            )
+            if choice is None:
+                return
+            if choice:
+                self._start_run_elevated()
+                return
+            # No → fall through to standard (non-elevated) run
 
         self._save_settings_to_env()
         self._show_page("run")
@@ -736,6 +824,14 @@ class AdrApp(tk.Tk):
         ).pack(side="left")
 
     def _cancel_run(self) -> None:
+        if self._elevated_mode:
+            # Can't kill an elevated process from a standard-user process
+            messagebox.showinfo(
+                "Cannot cancel elevated run",
+                "The diagnostic is running as Administrator in a separate window.\n"
+                "Close that PowerShell window to stop it.",
+            )
+            return
         if self._proc and self._proc.poll() is None:
             self._proc.terminate()
         self._progress.stop()
@@ -743,6 +839,144 @@ class AdrApp(tk.Tk):
         self._log("\n[Cancelled by user]\n")
         self._btn_start.configure(state="normal")
         self._btn_cancel.configure(state="disabled")
+
+    # ── Elevated-run path (Windows UAC) ───────────────────────────────────────
+
+    _ELEVATED_TIMEOUT = 600  # seconds (10 min)
+
+    def _start_run_elevated(self) -> None:
+        import ctypes
+
+        self._save_settings_to_env()
+        self._show_page("run")
+        self._log_clear()
+        self._btn_start.configure(state="disabled")
+        self._btn_cancel.configure(state="normal")   # enabled so user can see the message
+        self._btn_open.configure(state="disabled")
+        self._report_path = None
+        self._elevated_mode = True
+
+        for w in self._postrun.winfo_children():
+            w.destroy()
+
+        # Temp log file the elevated PowerShell will append to
+        fd, log_path = tempfile.mkstemp(suffix=".txt", prefix="adr_run_")
+        os.close(fd)
+        self._elevated_log_path = log_path
+        self._elevated_log_pos  = 0
+        self._elevated_start    = time.monotonic()
+
+        # Build ADR flags
+        use_ai     = self._bv["USE_AI"].get()
+        skip_agent = self._bv["ADR_SKIP_AGENT_SCAN"].get()
+        out_dir    = self._sv["ADR_OUTPUT_DIR"].get().strip()
+
+        flags = ["-SkipManualChecks"]
+        if use_ai:
+            flags.append("-UseAiEnrichment")
+            provider = self._sv["ADR_AI_PROVIDER"].get().strip()
+            if provider and provider != "auto":
+                flags += ["-AiProvider", provider]
+        if skip_agent:
+            flags.append("-SkipAgentScan")
+        if out_dir:
+            flags.append(f'-OutputDirectory "{out_dir}"')
+
+        flags_str = " ".join(flags)
+
+        # PowerShell script that runs elevated, streams output to the log file,
+        # then writes the sentinel so the polling loop knows it finished.
+        ps_script = (
+            f'$ErrorActionPreference = "Continue"\r\n'
+            f'& "{BACKEND}" {flags_str} *>> "{log_path}"\r\n'
+            f'$ec = $LASTEXITCODE\r\n'
+            f'Add-Content -Path "{log_path}" -Value "ADR_EXIT:$ec"\r\n'
+        )
+        encoded = base64.b64encode(ps_script.encode("utf-16-le")).decode("ascii")
+        params  = f"-NoProfile -ExecutionPolicy Bypass -EncodedCommand {encoded}"
+
+        self._log("[Requesting Administrator access via UAC…]\n\n")
+        self._run_status.configure(text="Waiting for UAC…", fg=C["warn"])
+
+        ret = ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", "powershell.exe", params, str(SCRIPT_DIR), 1
+        )
+
+        if ret <= 32:
+            # UAC cancelled or ShellExecute error
+            self._elevated_mode = False
+            try:
+                os.unlink(log_path)
+            except OSError:
+                pass
+            self._run_status.configure(text="Cancelled", fg=C["warn"])
+            self._log(
+                "[UAC prompt was cancelled — diagnostic not started.]\n"
+                "Click Start again if you would like to run as standard user instead.\n"
+            )
+            self._btn_start.configure(state="normal")
+            self._btn_cancel.configure(state="disabled")
+            return
+
+        self._progress.start(10)
+        self._run_status.configure(text="Running (elevated)…", fg=C["warn"])
+        self.after(1000, lambda: self._poll_elevated_log(log_path))
+
+    def _poll_elevated_log(self, log_path: str) -> None:
+        """Poll the temp log file written by the elevated PowerShell process."""
+        if not self._elevated_mode:
+            return
+
+        elapsed = time.monotonic() - self._elevated_start
+        if elapsed > self._ELEVATED_TIMEOUT:
+            self._log("\n[ERROR] Elevated run timed out after 10 minutes.\n")
+            self._on_elevated_done(-1, log_path)
+            return
+
+        try:
+            with open(log_path, "r", encoding="utf-8", errors="replace") as fh:
+                fh.seek(self._elevated_log_pos)
+                new_content = fh.read()
+                self._elevated_log_pos = fh.tell()
+        except OSError:
+            # File not accessible yet — retry
+            self.after(500, lambda: self._poll_elevated_log(log_path))
+            return
+
+        exit_code: int | None = None
+        lines_to_show: list = []
+        for line in new_content.splitlines(keepends=True):
+            if line.startswith("ADR_EXIT:"):
+                try:
+                    exit_code = int(line.split(":", 1)[1].strip())
+                except (ValueError, IndexError):
+                    exit_code = -1
+                break
+            lines_to_show.append(line)
+
+        if lines_to_show:
+            text = "".join(lines_to_show)
+            self._log(text)
+            for ln in lines_to_show:
+                if "Diagnostic report written to:" in ln:
+                    candidate = ln.split("Diagnostic report written to:")[-1].strip()
+                    if os.path.isfile(candidate):
+                        self._report_path = candidate
+
+        if exit_code is not None:
+            self._on_elevated_done(exit_code, log_path)
+        else:
+            self.after(500, lambda: self._poll_elevated_log(log_path))
+
+    def _on_elevated_done(self, rc: int, log_path: str) -> None:
+        self._elevated_mode     = False
+        self._elevated_log_path = None
+        self._elevated_log_pos  = 0
+        try:
+            os.unlink(log_path)
+        except OSError:
+            pass
+        self._on_done(rc)
 
     def _open_report(self) -> None:
         if not self._report_path or not os.path.isfile(self._report_path):
@@ -1109,12 +1343,62 @@ class AdrApp(tk.Tk):
     # ── Window close ──────────────────────────────────────────────────────────
 
     def _on_close(self) -> None:
-        if self._proc and self._proc.poll() is None:
+        if self._elevated_mode:
+            if messagebox.askyesno(
+                "Quit",
+                "A diagnostic is running as Administrator in a separate window.\n"
+                "Closing ADR Launcher will stop progress tracking (the script may still finish).\n\n"
+                "Close anyway?",
+            ):
+                self._elevated_mode = False
+                if self._elevated_log_path:
+                    try:
+                        os.unlink(self._elevated_log_path)
+                    except OSError:
+                        pass
+                self.destroy()
+        elif self._proc and self._proc.poll() is None:
             if messagebox.askyesno("Quit", "A diagnostic run is in progress. Cancel it and quit?"):
                 self._proc.terminate()
                 self.destroy()
         else:
             self.destroy()
+
+    # ── Update checker ────────────────────────────────────────────────────────
+
+    def _start_update_check(self) -> None:
+        threading.Thread(target=self._run_update_check, daemon=True).start()
+
+    def _run_update_check(self) -> None:
+        """Background thread: hit GitHub Releases API, schedule UI update if newer."""
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": f"ADR-Launcher/{ADR_VERSION}"},
+            )
+            with urllib.request.urlopen(req, timeout=7) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            tag      = data.get("tag_name", "")
+            html_url = data.get("html_url", f"https://github.com/{GITHUB_REPO}/releases")
+            if tag and _is_newer(tag, ADR_VERSION):
+                self.after(0, lambda: self._show_update_bar(tag, html_url))
+        except Exception:
+            pass  # no internet, rate-limited, pre-release-only repo, etc. — silently skip
+
+    def _show_update_bar(self, tag: str, url: str) -> None:
+        if not self._update_bar:
+            return
+        self._update_bar_url = url
+        self._update_bar_lbl.configure(
+            text=f"  ↑  Update available: {tag}  —  you are on v{ADR_VERSION}"
+        )
+        self._update_bar.pack(fill="x", pady=(0, 18))
+
+    def _open_update_url(self) -> None:
+        if self._update_bar_url:
+            import webbrowser
+            webbrowser.open(self._update_bar_url)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
