@@ -59,7 +59,7 @@ param(
 $ErrorActionPreference = "Continue"
 $ProgressPreference = "SilentlyContinue"
 
-$script:AdrVersion = "1.0"
+$script:AdrVersion = "1.2"
 
 # ── GUI launch (-Gui flag) ─────────────────────────────────────────────────────
 if ($Gui.IsPresent) {
@@ -80,6 +80,7 @@ if ($Gui.IsPresent) {
 }
 
 function Write-AdrBanner {
+    if ($env:ADR_GUI_MODE -eq "true") { return }   # GUI provides its own chrome
     $w = 60
     $border = '║'
     $h      = '═'
@@ -1834,7 +1835,8 @@ $remoteAgentData = "Scan skipped"
 if (-not $SkipAgentScan.IsPresent -and -not $skipAgentEnv) {
     Write-Host ""
     Write-Host "Run remote access agent scan? (searches Program Files + services for known agents, computes SHA-256) [Y/n]: " -NoNewline
-    try { $agentAns = [Console]::ReadLine() } catch { $agentAns = "y" }
+    if ($env:ADR_GUI_MODE -eq "true") { $agentAns = "y" }
+    else { try { $agentAns = [Console]::ReadLine() } catch { $agentAns = "y" } }
     if ([string]::IsNullOrWhiteSpace($agentAns) -or $agentAns -match "^[Yy]") {
         Write-AdrStatus "Scanning for remote access agents..."
         $remoteAgentData = Get-AdrRemoteAgents

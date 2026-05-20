@@ -13,6 +13,7 @@ import json
 import math
 import os
 import queue
+import re
 import shutil
 import struct
 import subprocess
@@ -357,6 +358,14 @@ def _is_admin() -> bool:
         return False
 
 
+# Matches ANSI/VT escape sequences — used to clean up script output in the log widget.
+_ANSI_RE = re.compile(r'\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub("", text)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Main application
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -563,28 +572,45 @@ class AdrApp(tk.Tk):
         tk.Label(row, text=f"  {BACKEND}", bg=C["card"],
                  fg=C["muted"], font=FONT_SMALL).pack(side="left")
 
-        # CLI reference
+        # CLI reference — each command gets its own copyable row
         cli_card = _section_label(pad, "CLI USAGE (WITHOUT GUI)")
         if PLATFORM == "win32":
-            cli_text = (
-                "PowerShell (run as Administrator):\n"
-                "  .\\adr.ps1\n"
-                "  .\\adr.ps1 -UseAiEnrichment\n"
-                "  .\\adr.ps1 -SkipManualChecks -SkipAgentScan\n"
-                "  .\\adr.ps1 -OutputDirectory C:\\Reports"
-            )
+            cli_cmds = [
+                (".\\adr.ps1",                                         "Basic run"),
+                (".\\adr.ps1 -UseAiEnrichment",                        "With AI research"),
+                (".\\adr.ps1 -SkipManualChecks -SkipAgentScan",        "Skip manual + agent"),
+                (".\\adr.ps1 -OutputDirectory C:\\Reports",            "Custom output dir"),
+            ]
         else:
-            cli_text = (
-                "Terminal:\n"
-                "  bash adr.sh\n"
-                "  bash adr.sh --ai\n"
-                "  bash adr.sh --skip-manual --skip-agent-scan\n"
-                "  bash adr.sh --output-dir ~/Reports"
-            )
-        tk.Label(
-            cli_card, text=cli_text, bg=C["card"], fg=C["muted"],
-            font=FONT_MONO, justify="left", anchor="w",
-        ).pack(anchor="w", padx=14, pady=10)
+            cli_cmds = [
+                ("bash adr.sh",                                        "Basic run"),
+                ("bash adr.sh --ai",                                   "With AI research"),
+                ("bash adr.sh --skip-manual --skip-agent-scan",        "Skip manual + agent"),
+                ("bash adr.sh --output-dir ~/Reports",                 "Custom output dir"),
+            ]
+        for cmd_str, hint in cli_cmds:
+            self._cli_cmd_row(cli_card, cmd_str, hint)
+
+    def _cli_cmd_row(self, parent: tk.Widget, cmd: str, hint: str) -> None:
+        """One copyable CLI command row in the Home page CLI section."""
+        row = tk.Frame(parent, bg=C["card"])
+        row.pack(fill="x", padx=14, pady=3)
+
+        tk.Label(row, text=hint, bg=C["card"], fg=C["muted"],
+                 font=FONT_SMALL, width=22, anchor="w").pack(side="left")
+        tk.Label(row, text=cmd, bg=C["bg"], fg=C["text"],
+                 font=FONT_MONO, anchor="w", padx=8, pady=2).pack(side="left", fill="x", expand=True)
+
+        def _copy(c=cmd) -> None:
+            self.clipboard_clear()
+            self.clipboard_append(c)
+
+        tk.Button(
+            row, text="⧉ Copy", font=FONT_SMALL,
+            bg=C["accent"], fg="white", relief="flat", padx=8, pady=2,
+            cursor="hand2", activebackground=C["sidebar_h"], activeforeground="white",
+            command=_copy,
+        ).pack(side="right", padx=(6, 0), pady=2)
 
     # ─────────────────────────────────────────────────────────────────────────
     # RUN PAGE
@@ -647,8 +673,10 @@ class AdrApp(tk.Tk):
 
     def _log(self, text: str) -> None:
         self._log_text.configure(state="normal")
+        at_bottom = self._log_text.yview()[1] >= 0.97
         self._log_text.insert("end", text)
-        self._log_text.see("end")
+        if at_bottom:
+            self._log_text.see("end")   # only auto-scroll when already at the bottom
         self._log_text.configure(state="disabled")
 
     def _log_clear(self) -> None:
@@ -737,6 +765,7 @@ class AdrApp(tk.Tk):
         proc_env = os.environ.copy()
         proc_env.update(load_env(ENV_FILE))
         proc_env["ADR_SKIP_MANUAL_CHECKS"] = "true"  # GUI handles manual checks
+        proc_env["ADR_GUI_MODE"] = "true"             # suppresses banner + auto-answers prompts
 
         self._log(f"$ {' '.join(cmd)}\n\n")
         try:
@@ -766,7 +795,7 @@ class AdrApp(tk.Tk):
         try:
             for raw in iter(proc.stdout.readline, b""):
                 line = raw.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
-                self._out_q.put(("line", line))
+                self._out_q.put(("line", _strip_ansi(line)))
         finally:
             rc = proc.wait()
             self._out_q.put(("done", rc))
@@ -851,7 +880,7 @@ class AdrApp(tk.Tk):
         self._show_page("run")
         self._log_clear()
         self._btn_start.configure(state="disabled")
-        self._btn_cancel.configure(state="normal")   # enabled so user can see the message
+        self._btn_cancel.configure(state="normal")
         self._btn_open.configure(state="disabled")
         self._report_path = None
         self._elevated_mode = True
@@ -859,7 +888,7 @@ class AdrApp(tk.Tk):
         for w in self._postrun.winfo_children():
             w.destroy()
 
-        # Temp log file the elevated PowerShell will append to
+        # Temp log file the elevated PowerShell process will write to via StreamWriter
         fd, log_path = tempfile.mkstemp(suffix=".txt", prefix="adr_run_")
         os.close(fd)
         self._elevated_log_path = log_path
@@ -884,26 +913,52 @@ class AdrApp(tk.Tk):
 
         flags_str = " ".join(flags)
 
-        # PowerShell script that runs elevated, streams output to the log file,
-        # then writes the sentinel so the polling loop knows it finished.
-        ps_script = (
-            f'$ErrorActionPreference = "Continue"\r\n'
-            f'& "{BACKEND}" {flags_str} *>> "{log_path}"\r\n'
-            f'$ec = $LASTEXITCODE\r\n'
-            f'Add-Content -Path "{log_path}" -Value "ADR_EXIT:$ec"\r\n'
-        )
+        # Build the elevated PowerShell script:
+        # - StreamWriter with UTF-8 no-BOM so Python can read the file reliably
+        # - *>&1 pipeline captures ALL streams (including Write-Host / Information)
+        #   and ForEach-Object stringify removes ANSI colour sequences naturally
+        # - ADR_GUI_MODE suppresses the ASCII banner and auto-answers the agent
+        #   scan Y/N prompt (the script's catch block defaults to "y")
+        ps_script = "\r\n".join([
+            '$ErrorActionPreference = "Continue"',
+            '$ProgressPreference    = "SilentlyContinue"',
+            '$env:ADR_GUI_MODE           = "true"',
+            '$env:ADR_SKIP_MANUAL_CHECKS = "true"',
+            f'$utf8   = [System.Text.UTF8Encoding]::new($false)',
+            f'$writer = [System.IO.StreamWriter]::new("{log_path}", $true, $utf8)',
+            '$adrOk = $true',
+            'try {',
+            f'    & "{BACKEND}" {flags_str} *>&1 | ForEach-Object {{',
+            '        $writer.WriteLine("$_")',
+            '        $writer.Flush()',
+            '    }',
+            '    if (-not $?) { $adrOk = $false }',
+            '} catch {',
+            '    $adrOk = $false',
+            '    $writer.WriteLine("ERROR: $_")',
+            '    $writer.Flush()',
+            '} finally {',
+            '    $ec = if ($adrOk) { 0 } else { 1 }',
+            '    $writer.WriteLine("ADR_EXIT:$ec")',
+            '    $writer.Flush()',
+            '    $writer.Close()',
+            '}',
+        ]) + "\r\n"
+
         encoded = base64.b64encode(ps_script.encode("utf-16-le")).decode("ascii")
-        params  = f"-NoProfile -ExecutionPolicy Bypass -EncodedCommand {encoded}"
+        # SW_HIDE=0 → console window never appears; -NonInteractive → Read-Host throws
+        # → catch block auto-answers the agent scan prompt with "y"
+        params = f"-NonInteractive -NoProfile -ExecutionPolicy Bypass -EncodedCommand {encoded}"
 
         self._log("[Requesting Administrator access via UAC…]\n\n")
         self._run_status.configure(text="Waiting for UAC…", fg=C["warn"])
 
+        SW_HIDE = 0
         ret = ctypes.windll.shell32.ShellExecuteW(
-            None, "runas", "powershell.exe", params, str(SCRIPT_DIR), 1
+            None, "runas", "powershell.exe", params, str(SCRIPT_DIR), SW_HIDE
         )
 
         if ret <= 32:
-            # UAC cancelled or ShellExecute error
             self._elevated_mode = False
             try:
                 os.unlink(log_path)
@@ -912,7 +967,7 @@ class AdrApp(tk.Tk):
             self._run_status.configure(text="Cancelled", fg=C["warn"])
             self._log(
                 "[UAC prompt was cancelled — diagnostic not started.]\n"
-                "Click Start again if you would like to run as standard user instead.\n"
+                "Click Start again to run as a standard user instead.\n"
             )
             self._btn_start.configure(state="normal")
             self._btn_cancel.configure(state="disabled")
@@ -946,13 +1001,14 @@ class AdrApp(tk.Tk):
         exit_code: int | None = None
         lines_to_show: list = []
         for line in new_content.splitlines(keepends=True):
-            if line.startswith("ADR_EXIT:"):
+            clean = _strip_ansi(line)
+            if clean.startswith("ADR_EXIT:"):
                 try:
-                    exit_code = int(line.split(":", 1)[1].strip())
+                    exit_code = int(clean.split(":", 1)[1].strip())
                 except (ValueError, IndexError):
                     exit_code = -1
                 break
-            lines_to_show.append(line)
+            lines_to_show.append(clean)
 
         if lines_to_show:
             text = "".join(lines_to_show)

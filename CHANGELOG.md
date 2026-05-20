@@ -12,27 +12,26 @@ How to use this file:
 **Commit message (copy/paste):**
 ```
 feat(gui): on-demand UAC elevation for Run Diagnostics (Windows)
-
-- Prompt Yes/No/Cancel when not already Administrator
-- Yes: elevate via ShellExecuteW runas, write output to temp log file,
-  poll log file every 500 ms and stream content to live log widget
-- ADR_EXIT sentinel written at end of elevated script to detect completion
-- No: run as standard user (existing path)
-- Cancel: return to GUI without starting
-- Cancel button shows informational message for elevated runs
-- Close-window handler warns before abandoning elevated run
+fix(gui): correct encoding for elevated log capture (UTF-8 via StreamWriter)
+fix(gui): hide elevated PowerShell window; suppress agent-scan prompt in GUI mode
+fix(ps1): skip ASCII banner and auto-answer agent scan when ADR_GUI_MODE=true
+feat(gui): copyable CLI command rows on Home page
+fix(gui): smart auto-scroll in log (stops when user scrolls up)
 ```
 
 **Changes:**
 - Added `_is_admin()` module-level function using `ctypes.windll.shell32.IsUserAnAdmin()` (Windows) or `os.geteuid()` (Unix)
-- Added `import base64` and `import time` to stdlib imports
+- Added `import base64`, `import re`, `import time` to stdlib imports
 - Added four elevated-run state variables to `AdrApp.__init__`: `_elevated_mode`, `_elevated_log_path`, `_elevated_log_pos`, `_elevated_start`
-- `_start_run()` shows a Yes/No/Cancel dialog when on Windows and not already running as Administrator; Yes path calls `_start_run_elevated()` and returns early
-- `_start_run_elevated()`: creates temp log file via `tempfile.mkstemp`, builds a Base64-encoded `-EncodedCommand` PowerShell script that runs `adr.ps1 *>> logfile` and appends `ADR_EXIT:$LASTEXITCODE` sentinel, elevates via `ShellExecuteW(None, "runas", "powershell.exe", ...)`, falls back gracefully if UAC is cancelled (ret ≤ 32)
-- `_poll_elevated_log()`: reads new bytes from the temp log file, appends to GUI log widget, detects report path, stops on `ADR_EXIT:` sentinel or 10-minute timeout
-- `_on_elevated_done()`: clears elevated state, deletes temp log file, calls shared `_on_done(rc)`
-- `_cancel_run()`: shows info dialog for elevated runs (can't kill an elevated process from standard user) instead of calling terminate
-- `_on_close()`: warns before closing if elevated run is in progress
+- `_start_run()` shows a Yes/No/Cancel dialog when on Windows and not already running as Administrator; Yes path calls `_start_run_elevated()` and returns early; sets `ADR_GUI_MODE=true` in subprocess env for all GUI runs
+- `_start_run_elevated()`: creates temp log via `tempfile.mkstemp`; builds `-EncodedCommand` PS script using `StreamWriter` (UTF-8 no-BOM) + `*>&1 | ForEach-Object` pipeline (captures all streams, strips ANSI naturally); sets `ADR_GUI_MODE=true` and `ADR_SKIP_MANUAL_CHECKS=true` in elevated env; uses `SW_HIDE=0` (no visible console window) and `-NonInteractive` so interactive prompts throw → catch defaults to "y"
+- `_poll_elevated_log()`: reads new bytes as UTF-8, strips residual ANSI via `_strip_ansi()`, detects `ADR_EXIT:` sentinel for completion or 10-minute timeout
+- `_reader_thread()`: applies `_strip_ansi()` to all subprocess output lines
+- `_on_elevated_done()`, `_cancel_run()`, `_on_close()`: elevated-run aware
+- `Write-AdrBanner` in `adr.ps1`: skipped when `$env:ADR_GUI_MODE = "true"` (avoids Unicode box-drawing encoding issues over the log pipe)
+- Agent scan in `adr.ps1`: auto-answers "y" when `$env:ADR_GUI_MODE = "true"` instead of blocking on `[Console]::ReadLine()`
+- Home page CLI section replaced: each command now has its own row with a `⧉ Copy` button that puts the command in the clipboard
+- Log auto-scroll: only scrolls to bottom when already near the bottom — allows scrolling up to review past output without being yanked back
 
 ---
 
