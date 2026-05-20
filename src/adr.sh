@@ -7,6 +7,8 @@
 set -o pipefail 2>/dev/null || true
 
 USE_AI=0
+SKIP_MANUAL=0
+SKIP_AGENT_SCAN=0
 OUTPUT_DIR=""
 AI_PROVIDER=""
 AI_MODEL=""
@@ -16,7 +18,7 @@ ENV_FILE_STATUS=""
 
 usage() {
     cat <<'USAGE'
-Usage: ./adr.sh [--ai] [--ai-provider PROVIDER] [--ai-model MODEL] [--ai-endpoint URL] [--env-file FILE] [--output-dir DIR]
+Usage: ./adr.sh [--ai] [--ai-provider PROVIDER] [--ai-model MODEL] [--ai-endpoint URL] [--env-file FILE] [--output-dir DIR] [--skip-manual]
 
 Options:
   --ai              Add optional AI research suggestions.
@@ -28,6 +30,11 @@ Options:
   --env-file FILE   Optional env file. Defaults to adr.env beside this script
                     when present. Used only for optional AI settings.
   --output-dir DIR  Write the report to DIR instead of the script directory.
+  --skip-manual     Skip the interactive hardware check GUI. The manual check
+                    fields in the report are left blank for self-completion.
+                    Also controlled by ADR_SKIP_MANUAL_CHECKS=true in adr.env.
+  --skip-agent-scan Skip the remote agent scan Y/N prompt entirely.
+                    Also controlled by ADR_SKIP_AGENT_SCAN=true in adr.env.
   -h, --help        Show this help.
 USAGE
 }
@@ -80,6 +87,12 @@ while [ "$#" -gt 0 ]; do
         -h|--help)
             usage
             exit 0
+            ;;
+        --skip-manual)
+            SKIP_MANUAL=1
+            ;;
+        --skip-agent-scan)
+            SKIP_AGENT_SCAN=1
             ;;
         *)
             echo "Unknown option: $1" >&2
@@ -677,6 +690,325 @@ call_ai_enrichment() {
     parse_ai_response "$provider" "$response"
 }
 
+# ─── Manual hardware check GUI ────────────────────────────────────────────────
+
+MANUAL_DISPLAY="Not tested"
+MANUAL_TOUCH="Not tested"
+MANUAL_KEYBOARD="Not tested"
+MANUAL_TRACKPAD="Not tested"
+MANUAL_LEFT_SPEAKER="Not tested"
+MANUAL_RIGHT_SPEAKER="Not tested"
+MANUAL_MICROPHONE="Not tested"
+MANUAL_WEBCAM="Not tested"
+MANUAL_NOTES=""
+MANUAL_MODE="Not run"
+
+_adr_label_result() {
+    case "$1" in
+        pass)       printf 'Pass' ;;
+        fail)       printf 'Fail' ;;
+        na)         printf 'N/A' ;;
+        skipped)    printf 'Skipped — fill in manually' ;;
+        not_tested) printf 'Not tested' ;;
+        *)          printf '%s' "$1" ;;
+    esac
+}
+
+_adr_json_field() {
+    local json="$1" field="$2"
+    printf '%s' "$json" | python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    v = d.get('$field', 'not_tested')
+    print(str(v).replace(chr(10), ' ').strip())
+except Exception:
+    print('not_tested')
+" 2>/dev/null || printf 'not_tested'
+}
+
+launch_manual_gui() {
+    local gui="$SCRIPT_DIR/adr_checks.py"
+
+    if [ "$SKIP_MANUAL" = "1" ] || [ "${ADR_SKIP_MANUAL_CHECKS:-false}" = "true" ]; then
+        MANUAL_MODE="Skipped"
+        local s="Skipped — fill in manually"
+        MANUAL_DISPLAY="$s"; MANUAL_TOUCH="$s"; MANUAL_KEYBOARD="$s"
+        MANUAL_TRACKPAD="$s"; MANUAL_LEFT_SPEAKER="$s"
+        MANUAL_RIGHT_SPEAKER="$s"; MANUAL_MICROPHONE="$s"; MANUAL_WEBCAM="$s"
+        return 0
+    fi
+
+    if ! have python3; then
+        printf 'Manual checks: python3 not found — section left blank for manual completion.\n' >&2
+        MANUAL_MODE="Unavailable: python3 not found"
+        return 1
+    fi
+
+    if [ ! -f "$gui" ]; then
+        printf 'Manual checks: adr_checks.py not found beside this script — section left blank.\n' >&2
+        MANUAL_MODE="Unavailable: adr_checks.py not found"
+        return 1
+    fi
+
+    if [ "$UNAME_S" = "Linux" ] && [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
+        printf 'Manual checks: no display server detected — section left blank.\n' >&2
+        MANUAL_MODE="Unavailable: no display server"
+        return 1
+    fi
+
+    local tmp_json
+    tmp_json=$(mktemp "${TMPDIR:-/tmp}/adr_checks_XXXXXX.json")
+
+    printf 'Launching manual hardware check window — complete checks then click Save Results.\n'
+    python3 "$gui" \
+        --output-file "$tmp_json" \
+        --host "$HOST_NAME" \
+        --timestamp "$TIMESTAMP" 2>/dev/null
+
+    if [ ! -s "$tmp_json" ]; then
+        MANUAL_MODE="Window closed without saving"
+        rm -f "$tmp_json"
+        return 1
+    fi
+
+    local json
+    json=$(cat "$tmp_json")
+    rm -f "$tmp_json"
+
+    MANUAL_DISPLAY=$(     _adr_label_result "$(_adr_json_field "$json" display)")
+    MANUAL_TOUCH=$(       _adr_label_result "$(_adr_json_field "$json" touch_screen)")
+    MANUAL_KEYBOARD=$(    _adr_label_result "$(_adr_json_field "$json" keyboard)")
+    MANUAL_TRACKPAD=$(    _adr_label_result "$(_adr_json_field "$json" trackpad)")
+    MANUAL_LEFT_SPEAKER=$(_adr_label_result "$(_adr_json_field "$json" left_speaker)")
+    MANUAL_RIGHT_SPEAKER=$(_adr_label_result "$(_adr_json_field "$json" right_speaker)")
+    MANUAL_MICROPHONE=$(  _adr_label_result "$(_adr_json_field "$json" microphone)")
+    MANUAL_WEBCAM=$(      _adr_label_result "$(_adr_json_field "$json" webcam)")
+    MANUAL_NOTES=$(       _adr_json_field   "$json" notes)
+    MANUAL_MODE=$(        _adr_json_field   "$json" mode)
+    return 0
+}
+
+# ─── Amazon SES email delivery (AWS SigV4 — requires openssl + curl) ─────────
+
+_ses_sha256_hex() {
+    printf '%s' "$1" | openssl dgst -sha256 2>/dev/null | awk '{print $NF}'
+}
+
+_ses_hmac_hex_key() {
+    printf '%s' "$2" | openssl dgst -sha256 -mac HMAC \
+        -macopt "hexkey:$1" 2>/dev/null | awk '{print $NF}'
+}
+
+_ses_hmac_str_key() {
+    printf '%s' "$2" | openssl dgst -sha256 -hmac "$1" 2>/dev/null | awk '{print $NF}'
+}
+
+_ses_derive_signing_key() {
+    local secret="$1" date="$2" region="$3" service="$4"
+    local k1 k2 k3 k4
+    k1=$(_ses_hmac_str_key "AWS4${secret}" "$date")
+    k2=$(_ses_hmac_hex_key "$k1"           "$region")
+    k3=$(_ses_hmac_hex_key "$k2"           "$service")
+    k4=$(_ses_hmac_hex_key "$k3"           "aws4_request")
+    printf '%s' "$k4"
+}
+
+send_ses_email() {
+    local report_file="$1"
+    local ses_from="${ADR_SES_FROM_EMAIL:-}"
+    local ses_to="${ADR_SES_TO_EMAIL:-}"
+    local ses_key="${ADR_SES_AWS_ACCESS_KEY_ID:-}"
+    local ses_secret="${ADR_SES_AWS_SECRET_ACCESS_KEY:-}"
+    local ses_region="${ADR_SES_AWS_REGION:-us-east-1}"
+
+    if [ -z "$ses_from" ] || [ -z "$ses_to" ] || \
+       [ -z "$ses_key" ]  || [ -z "$ses_secret" ]; then
+        printf 'SES: skipped — configure ADR_SES_FROM_EMAIL, ADR_SES_TO_EMAIL, ADR_SES_AWS_ACCESS_KEY_ID, ADR_SES_AWS_SECRET_ACCESS_KEY\n'
+        return 1
+    fi
+    if ! have openssl; then
+        printf 'SES: skipped — openssl required for request signing\n' >&2; return 1
+    fi
+    if ! have curl; then
+        printf 'SES: skipped — curl required\n' >&2; return 1
+    fi
+
+    local body_text subject j_from j_to j_subject j_body payload
+    body_text=$(cat "$report_file" 2>/dev/null || printf '')
+    subject="ADR Report: ${HOST_SAFE} (${TIMESTAMP})"
+    j_from=$(    printf '%s' "$ses_from"  | json_escape)
+    j_to=$(      printf '%s' "$ses_to"    | json_escape)
+    j_subject=$( printf '%s' "$subject"   | json_escape)
+    j_body=$(    printf '%s' "$body_text" | json_escape)
+    payload=$(printf '{"FromEmailAddress":"%s","Destination":{"ToAddresses":["%s"]},"Content":{"Simple":{"Subject":{"Data":"%s","Charset":"UTF-8"},"Body":{"Text":{"Data":"%s","Charset":"UTF-8"}}}}}' \
+        "$j_from" "$j_to" "$j_subject" "$j_body")
+
+    local amz_date date_stamp host canonical_uri
+    amz_date=$(     date -u '+%Y%m%dT%H%M%SZ')
+    date_stamp=$(   date -u '+%Y%m%d')
+    host="email.${ses_region}.amazonaws.com"
+    canonical_uri="/v2/email/outbound-emails"
+
+    local payload_hash canon_headers signed_headers canon_req cr_hash
+    payload_hash=$(_ses_sha256_hex "$payload")
+    signed_headers="content-type;host;x-amz-date"
+    canon_req=$(printf 'POST\n%s\n\ncontent-type:application/json\nhost:%s\nx-amz-date:%s\n\n%s\n%s' \
+        "$canonical_uri" "$host" "$amz_date" "$signed_headers" "$payload_hash")
+    cr_hash=$(printf '%s' "$canon_req" | openssl dgst -sha256 2>/dev/null | awk '{print $NF}')
+
+    local cred_scope str_to_sign signing_key signature auth
+    cred_scope="${date_stamp}/${ses_region}/ses/aws4_request"
+    str_to_sign=$(printf 'AWS4-HMAC-SHA256\n%s\n%s\n%s' "$amz_date" "$cred_scope" "$cr_hash")
+    signing_key=$(_ses_derive_signing_key "$ses_secret" "$date_stamp" "$ses_region" "ses")
+    signature=$(printf '%s' "$str_to_sign" | openssl dgst -sha256 -mac HMAC \
+        -macopt "hexkey:${signing_key}" 2>/dev/null | awk '{print $NF}')
+    auth="AWS4-HMAC-SHA256 Credential=${ses_key}/${cred_scope}, SignedHeaders=${signed_headers}, Signature=${signature}"
+
+    local resp http_code resp_body
+    resp=$(curl -sS -w '\n%{http_code}' \
+        -X POST "https://${host}${canonical_uri}" \
+        -H "Content-Type: application/json" \
+        -H "Host: ${host}" \
+        -H "X-Amz-Date: ${amz_date}" \
+        -H "Authorization: ${auth}" \
+        --data-binary "$payload" 2>&1)
+    http_code=$(printf '%s' "$resp" | tail -n 1)
+    resp_body=$( printf '%s' "$resp" | head -n -1)
+
+    case "$http_code" in
+        200|201|202) printf 'SES: report emailed successfully to %s\n' "$ses_to" ;;
+        *) printf 'SES: send failed (HTTP %s): %s\n' "$http_code" "$resp_body" >&2 ;;
+    esac
+}
+
+# ─── Root drive / filesystem anomaly check ────────────────────────────────────
+
+get_root_drive_anomalies() {
+    local anomalies=""
+
+    if [ "$UNAME_S" = "Darwin" ]; then
+        local known="Applications Library System Users Volumes private bin dev etc home lib mnt opt sbin tmp usr var cores .vol .file .fseventsd .Spotlight-V100 .DocumentRevisions-V100 .PKInstallSandboxManager .TemporaryItems .Trashes .MobileBackups"
+        while IFS= read -r item; do
+            local ok=false
+            for k in $known; do [ "$item" = "$k" ] && ok=true && break; done
+            $ok || anomalies="${anomalies:+$anomalies; }${item}"
+        done < <(ls -A / 2>/dev/null)
+        printf '%s\n' "${anomalies:-No unexpected items at /}"
+
+    elif [ "$UNAME_S" = "Linux" ]; then
+        local known="bin boot dev etc home lib lib32 lib64 libx32 media mnt opt proc root run sbin srv sys tmp usr var snap lost+found initrd.img initrd.img.old vmlinuz vmlinuz.old"
+        while IFS= read -r item; do
+            local ok=false
+            for k in $known; do [ "$item" = "$k" ] && ok=true && break; done
+            $ok || anomalies="${anomalies:+$anomalies; }${item}"
+        done < <(ls -A / 2>/dev/null)
+        printf '%s\n' "${anomalies:-No unexpected items at /}"
+
+    else
+        printf 'Root drive anomaly check not implemented for %s\n' "$UNAME_S"
+    fi
+}
+
+# ─── Remote access agent detection ────────────────────────────────────────────
+
+_sha256_file() {
+    local path="$1"
+    if have sha256sum; then
+        sha256sum "$path" 2>/dev/null | awk '{print $1}'
+    elif have shasum; then
+        shasum -a 256 "$path" 2>/dev/null | awk '{print $1}'
+    elif have openssl; then
+        openssl dgst -sha256 "$path" 2>/dev/null | awk '{print $NF}'
+    else
+        printf 'unavailable (no sha256sum/shasum/openssl)'
+    fi
+}
+
+_check_agent() {
+    local name="$1" path="$2" found_ref="$3"
+    if [ -f "$path" ]; then
+        local h; h=$(_sha256_file "$path")
+        eval "${found_ref}=\"\${${found_ref}}\${${found_ref}:+\\n}  ${name}\\n    Path:    ${path}\\n    SHA-256: ${h}\""
+    fi
+}
+
+get_remote_agents() {
+    local found=""
+
+    if [ "$UNAME_S" = "Darwin" ]; then
+        _check_agent "TeamViewer"                    "/Applications/TeamViewer.app/Contents/MacOS/TeamViewer"                   found
+        _check_agent "AnyDesk"                       "/Applications/AnyDesk.app/Contents/MacOS/AnyDesk"                         found
+        _check_agent "RustDesk"                      "/Applications/RustDesk.app/Contents/MacOS/rustdesk"                       found
+        _check_agent "ScreenConnect (CW Control)"    "/Applications/ConnectWise Control.app/Contents/MacOS/ScreenConnect.ClientService" found
+        _check_agent "Atera Agent"                   "/Library/Atera Networks/AteraAgent/AteraAgent"                            found
+        _check_agent "Splashtop"                     "/Applications/Splashtop Business.app/Contents/MacOS/Splashtop Business"   found
+        _check_agent "LogMeIn"                       "/Library/Application Support/LogMeIn/bin/logmein"                         found
+        _check_agent "Parsec"                        "/Applications/Parsec.app/Contents/MacOS/parsecd"                          found
+        _check_agent "NinjaRMM Agent"                "/Library/Application Support/NinjaRMMAgent/ninjarmmagent"                 found
+        _check_agent "Pulseway"                      "/Library/Application Support/Pulseway/pwdaemon"                           found
+        _check_agent "MeshAgent (MeshCentral)"       "/usr/local/mesh_agent/meshagent"                                          found
+        _check_agent "DWAgent (DWService)"           "/usr/local/dwagent/dwagsvc"                                               found
+        _check_agent "Huntress Agent"                "/Library/Application Support/Huntress/huntress"                            found
+        _check_agent "Zoho Assist"                   "/Library/Application Support/ZohoAssist/ZohoAssistService"                 found
+        _check_agent "ISL Online"                    "/Applications/ISL Light.app/Contents/MacOS/ISL Light"                     found
+        _check_agent "Remote Utilities"              "/Applications/Remote Utilities.app/Contents/MacOS/rutserv"                 found
+        _check_agent "N-able Take Control"           "/Library/Application Support/SolarWinds/TSRemoteControl/BASupportExpressNCST" found
+        _check_agent "Supremo"                       "/Applications/Supremo.app/Contents/MacOS/Supremo"                         found
+        _check_agent "Tactical RMM Agent"            "/usr/local/bin/tacticalrmm"                                               found
+        _check_agent "ConnectWise Automate (LT)"     "/usr/local/ltc/ltc"                                                       found
+        _check_agent "Action1 RMM"                   "/usr/local/action1/action1"                                               found
+        _check_agent "SimpleHelp"                    "/usr/local/SimpleHelp/remote/remote"                                      found
+        _check_agent "GoToMyPC"                      "/Applications/GoToMyPC.app/Contents/MacOS/GoToMyPC"                       found
+
+    elif [ "$UNAME_S" = "Linux" ]; then
+        _check_agent "TeamViewer Daemon"             "/opt/teamviewer/tv_bin/TVHeadless"                                        found
+        _check_agent "TeamViewer"                    "/opt/teamviewer/tv_bin/TeamViewer"                                        found
+        _check_agent "AnyDesk"                       "/usr/bin/anydesk"                                                         found
+        _check_agent "AnyDesk (opt)"                 "/opt/anydesk/anydesk"                                                     found
+        _check_agent "RustDesk"                      "/usr/bin/rustdesk"                                                        found
+        _check_agent "RustDesk (opt)"                "/opt/rustdesk/rustdesk"                                                   found
+        _check_agent "Splashtop"                     "/opt/splashtop/SRAgent"                                                   found
+        _check_agent "NinjaRMM Agent"                "/opt/NinjaRMMAgent/ninjarmmagent"                                         found
+        _check_agent "Atera Agent"                   "/usr/lib/AteraNetworks/AteraAgent/AteraAgent"                             found
+        _check_agent "Pulseway"                      "/opt/pulseway/pwdaemon"                                                   found
+        _check_agent "DWAgent (DWService)"           "/usr/local/dwagent/dwagsvc"                                               found
+        _check_agent "MeshAgent (MeshCentral)"       "/usr/local/mesh_agent/meshagent"                                          found
+        _check_agent "MeshAgent (opt)"               "/opt/mesh_agent/meshagent"                                                found
+        _check_agent "Huntress Agent"                "/opt/huntress/huntress"                                                   found
+        _check_agent "Zoho Assist"                   "/usr/local/ZohoMeetingClient/zohoassist"                                  found
+        _check_agent "ISL Online"                    "/usr/local/islonline/islonline"                                           found
+        _check_agent "TightVNC"                      "/usr/bin/tvnserver"                                                       found
+        _check_agent "x11vnc"                        "/usr/bin/x11vnc"                                                          found
+        _check_agent "Remote Utilities Host"         "/usr/bin/rutserv"                                                         found
+        _check_agent "Tactical RMM Agent"            "/usr/local/bin/tacticalrmm"                                               found
+        _check_agent "ConnectWise Automate (LT)"     "/usr/local/ltc/ltc"                                                       found
+        _check_agent "Action1 RMM"                   "/usr/local/action1/action1"                                               found
+        _check_agent "Level RMM"                     "/usr/local/bin/level"                                                     found
+        _check_agent "Supremo"                       "/usr/bin/supremo"                                                         found
+        _check_agent "Naverisk Agent"                "/opt/naverisk/NaveriskAgent"                                              found
+        _check_agent "N-able Agent"                  "/opt/SolarWinds/n-central/agent/bin/agent"                                found
+        _check_agent "SimpleHelp"                    "/usr/local/SimpleHelp/remote/remote"                                      found
+        _check_agent "Parsec (snap)"                 "/snap/parsec/current/usr/bin/parsecd"                                     found
+    fi
+
+    # Running process sweep for agents that may live in non-standard or user paths
+    local proc_hits=""
+    if have ps; then
+        proc_hits=$(ps -eo comm,args 2>/dev/null | grep -Ei \
+            '(teamviewer|anydesk|rustdesk|screenconnect|atera|splashtop|logmein|parsecd|ninja|dwagsvc|meshagent|huntress|zohoassist|isllight|islalways|ltsvc|pulseway|supremo|tvnserver|x11vnc|rutserv|tactical|action1|level|naverisk|simplehelp|bomgar|radmin|NetSupportServer|GoToAssist|GoToResolve|RemotePC|Freshservice)' \
+            | grep -v 'grep' | awk '{print $1}' | sort -u | clean_join)
+    fi
+
+    if [ -z "$found" ] && [ -z "$proc_hits" ]; then
+        printf 'No known remote access agents detected in standard locations or running processes\n'
+        return
+    fi
+
+    [ -n "$found" ] && printf 'Installed agent executables (with SHA-256):\n%b\n' "$found"
+    [ -n "$proc_hits" ] && printf 'Agent-related running processes: %s\n' "$proc_hits"
+}
+
 approx_age_from_bios_date() {
     date_value=$1
     if [ -z "$date_value" ] || printf '%s' "$date_value" | grep -qi '^Unavailable'; then
@@ -700,9 +1032,35 @@ load_env_file "$ENV_FILE"
 HOST_NAME=$(hostname 2>/dev/null || uname -n 2>/dev/null || printf '%s\n' UNKNOWN)
 HOST_SAFE=$(printf '%s' "$HOST_NAME" | tr -c 'A-Za-z0-9_.-' '_')
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+
+# Determine UNAME_S early so launch_manual_gui can test it
+UNAME_S=$(uname -s 2>/dev/null || printf '%s\n' Unknown)
+
+launch_manual_gui
+
+# ── Root drive anomaly check (always runs, lightweight) ────────────────────
+ROOT_DRIVE_ANOMALIES=$(get_root_drive_anomalies)
+
+# ── Remote agent scan (optional — Y/N prompt unless skipped) ───────────────
+REMOTE_AGENT_DATA="Scan skipped"
+if [ "$SKIP_AGENT_SCAN" != "1" ] && [ "${ADR_SKIP_AGENT_SCAN:-false}" != "true" ]; then
+    if [ -t 0 ]; then
+        printf '\nRun remote access agent scan? (searches standard install paths for known agents, computes SHA-256) [Y/n]: '
+        read -r _agent_ans </dev/tty
+        case "$(printf '%s' "${_agent_ans:-y}" | tr '[:lower:]' '[:upper:]')" in
+            N|NO) printf 'Agent scan skipped.\n\n' ;;
+            *)
+                printf 'Scanning for remote access agents...\n'
+                REMOTE_AGENT_DATA=$(get_remote_agents)
+                ;;
+        esac
+    else
+        REMOTE_AGENT_DATA=$(get_remote_agents)
+    fi
+fi
+
 OUTPUT_FILE=$OUTPUT_DIR/ADR-$HOST_SAFE-$TIMESTAMP.txt
 GENERATED_AT=$(date '+%Y-%m-%d %H:%M:%S %z')
-UNAME_S=$(uname -s 2>/dev/null || printf '%s\n' Unknown)
 if [ "$(id -u 2>/dev/null || printf '999')" = "0" ]; then
     IS_ROOT="true"
 else
@@ -1100,6 +1458,8 @@ CloudSync: $CLOUD_SYNC_STATUS
 MicrophoneUsage: $MIC_USAGE
 CameraUsage: $CAMERA_USAGE
 MDM: $MDM_STATUS
+RootDriveAnomalies: $ROOT_DRIVE_ANOMALIES
+RemoteAgents: $REMOTE_AGENT_DATA
 EOF
 )
 
@@ -1151,16 +1511,17 @@ emit_section() {
     printf 'Backup Software Active: %s\n' "$BACKUP_STATUS"
     printf '%s\n' "Admin / BIOS Password Provided: Manual Check Required (do not collect or store passwords)"
     printf '\n%s\n\n' "Display & Visuals"
-    printf '%s\n' "Display Intact/No Cracks: Manual Check Required"
-    printf '%s\n' "Backlight Functional/Even: Manual Check Required"
-    printf 'Touch Screen Responsive: Manual Check Required (detected: %s)\n' "$TOUCH_DETECTION"
-    printf 'External Video Output OK: Manual Check Required (detected display/video: %s)\n' "$DISPLAY_DETECTION"
+    printf 'Display Intact/No Cracks (manual): %s\n' "$MANUAL_DISPLAY"
+    printf 'Touch Screen Responsive (manual): %s (detected: %s)\n' "$MANUAL_TOUCH" "$TOUCH_DETECTION"
+    printf 'External Video Output OK (detected): %s\n' "$DISPLAY_DETECTION"
     printf '\n%s\n\n' "Input & Peripheral Health"
-    printf 'Keyboard Working: Manual Check Required (detected: %s)\n' "$KEYBOARD_DETECTION"
-    printf 'Trackpad Working: Manual Check Required (detected: %s)\n' "$TRACKPAD_DETECTION"
-    printf 'Webcam Working: Manual Check Required (detected: %s)\n' "$WEBCAM_DETECTION"
+    printf 'Keyboard Working (manual): %s (detected: %s)\n' "$MANUAL_KEYBOARD" "$KEYBOARD_DETECTION"
+    printf 'Trackpad Working (manual): %s (detected: %s)\n' "$MANUAL_TRACKPAD" "$TRACKPAD_DETECTION"
+    printf 'Webcam Working (manual): %s (detected: %s)\n' "$MANUAL_WEBCAM" "$WEBCAM_DETECTION"
     printf 'Internet/WiFi Working: %s\n' "$NETWORK_SUMMARY"
-    printf 'Speakers/Mic Working: Manual Check Required (detected: %s; usage: %s)\n' "$AUDIO_DETECTION" "$MIC_USAGE"
+    printf 'Left Speaker Working (manual): %s\n' "$MANUAL_LEFT_SPEAKER"
+    printf 'Right Speaker Working (manual): %s\n' "$MANUAL_RIGHT_SPEAKER"
+    printf 'Microphone Working (manual): %s (usage: %s)\n' "$MANUAL_MICROPHONE" "$MIC_USAGE"
     printf '\n%s\n\n' "Power & Thermal Stats"
     printf '%s\n' "DC Jack/Type-C Port Condition: Manual Check Required"
     printf 'Charging Functional: (Yes/No) %s\n' "$CHARGING_FUNCTIONAL"
@@ -1229,10 +1590,28 @@ emit_section() {
     printf '%s\n' "$AUDIO_DETECTION" | indent_block
     printf 'Microphone Privacy/Usage: %s\n' "$MIC_USAGE"
 
+    emit_section "Root Drive / Filesystem Anomalies"
+    printf '%s\n' "$ROOT_DRIVE_ANOMALIES" | indent_block
+
+    emit_section "Remote Access Agents"
+    printf '%s\n' "$REMOTE_AGENT_DATA" | indent_block
+
     emit_section "Manual Checks Required"
+    printf 'Manual Check Mode: %s\n' "$MANUAL_MODE"
+    printf '\n%s\n' "Hardware Tests"
+    printf 'Display (no cracks, backlight even): %s\n' "$MANUAL_DISPLAY"
+    printf 'Touch Screen: %s\n' "$MANUAL_TOUCH"
+    printf 'Keyboard (all keys responding): %s\n' "$MANUAL_KEYBOARD"
+    printf 'Trackpad / Pointing Device: %s\n' "$MANUAL_TRACKPAD"
+    printf 'Left Speaker: %s\n' "$MANUAL_LEFT_SPEAKER"
+    printf 'Right Speaker: %s\n' "$MANUAL_RIGHT_SPEAKER"
+    printf 'Microphone: %s\n' "$MANUAL_MICROPHONE"
+    printf 'Webcam (live image visible): %s\n' "$MANUAL_WEBCAM"
+    if [ -n "$MANUAL_NOTES" ]; then
+        printf 'Technician Notes: %s\n' "$MANUAL_NOTES"
+    fi
+    printf '\n%s\n' "Physical Inspection (fill in manually)"
     printf '%s\n' "Estimated device value and device age confirmation"
-    printf '%s\n' "Display glass, panel damage, backlight evenness, and external display output"
-    printf '%s\n' "Keyboard, trackpad, touchscreen, webcam, speakers, and microphone functional testing"
     printf '%s\n' "DC jack/USB-C port tightness, charger compatibility, liquid damage, dust, dents, and missing screws"
     printf '%s\n' "Admin/BIOS password availability without recording the password"
     printf '%s\n' "Previous repair evidence, initial issue, secondary risks, and parts/labor quote"
@@ -1247,3 +1626,7 @@ emit_section() {
 } > "$OUTPUT_FILE"
 
 printf 'Diagnostic report written to: %s\n' "$OUTPUT_FILE"
+
+if [ "${ADR_SES_ENABLED:-false}" = "true" ]; then
+    send_ses_email "$OUTPUT_FILE"
+fi

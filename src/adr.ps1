@@ -31,6 +31,15 @@ file exists. The env file is only used for optional AI settings.
 
 .PARAMETER OutputDirectory
 Optional output folder. Defaults to the folder containing this script.
+
+.PARAMETER SkipManualChecks
+Skip the interactive hardware check GUI. Manual check fields in the report
+are left blank for the technician to complete afterward.
+Also controlled by ADR_SKIP_MANUAL_CHECKS=true in adr.env.
+
+.PARAMETER SkipAgentScan
+Skip the interactive remote access agent scan prompt. When omitted the script
+asks Y/N before scanning. Also controlled by ADR_SKIP_AGENT_SCAN=true in adr.env.
 #>
 
 [CmdletBinding()]
@@ -41,7 +50,9 @@ param(
     [string]$AiModel,
     [string]$AiEndpoint,
     [string]$EnvFile,
-    [string]$OutputDirectory
+    [string]$OutputDirectory,
+    [switch]$SkipManualChecks,
+    [switch]$SkipAgentScan
 )
 
 $ErrorActionPreference = "Continue"
@@ -1285,6 +1296,442 @@ function Invoke-AdrAiEnrichment {
     }
 }
 
+function Invoke-AdrManualGui {
+    param(
+        [bool]$Skip,
+        [bool]$SkipFromEnv,
+        [string]$HostName = "Unknown",
+        [string]$Timestamp = ""
+    )
+
+    $blank = "Skipped — fill in manually"
+    $result = [ordered]@{
+        display       = "Not tested"
+        touch_screen  = "Not tested"
+        keyboard      = "Not tested"
+        trackpad      = "Not tested"
+        left_speaker  = "Not tested"
+        right_speaker = "Not tested"
+        microphone    = "Not tested"
+        webcam        = "Not tested"
+        notes         = ""
+        mode          = "Not run"
+    }
+
+    if ($Skip -or $SkipFromEnv) {
+        foreach ($k in @("display","touch_screen","keyboard","trackpad","left_speaker","right_speaker","microphone","webcam")) {
+            $result[$k] = $blank
+        }
+        $result.mode = "Skipped"
+        return $result
+    }
+
+    $scriptBase = if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) { $PSScriptRoot }
+                  else { (Get-Location).Path }
+    $guiScript  = Join-Path $scriptBase "adr_checks.py"
+    $python     = $null
+
+    foreach ($cmd in @("python3", "python")) {
+        try {
+            $ver = & $cmd --version 2>&1
+            if ("$ver" -match "Python 3") { $python = $cmd; break }
+        }
+        catch { continue }
+    }
+
+    if ($null -eq $python) {
+        Write-Host "Manual checks: Python 3 not found — section left blank for manual completion."
+        $result.mode = "Unavailable: python3 not found"
+        return $result
+    }
+
+    if (-not (Test-Path -LiteralPath $guiScript)) {
+        Write-Host "Manual checks: adr_checks.py not found beside this script — section left blank."
+        $result.mode = "Unavailable: adr_checks.py not found"
+        return $result
+    }
+
+    $tmpBase = [System.IO.Path]::GetTempFileName()
+    Remove-Item -LiteralPath $tmpBase -ErrorAction SilentlyContinue
+    $tmpJson = $tmpBase -replace "\.tmp$", ".json"
+
+    Write-Host "Launching manual hardware check window — complete the checks then click Save Results."
+    try {
+        & $python $guiScript --output-file $tmpJson --host $HostName --timestamp $Timestamp 2>$null
+
+        if ((Test-Path -LiteralPath $tmpJson) -and (Get-Item $tmpJson).Length -gt 0) {
+            $data = Get-Content -LiteralPath $tmpJson -Raw -ErrorAction Stop | ConvertFrom-Json
+            foreach ($k in @("display","touch_screen","keyboard","trackpad","left_speaker","right_speaker","microphone","webcam")) {
+                $raw = "$($data.$k)"
+                $result[$k] = if ([string]::IsNullOrWhiteSpace($raw)) { "Not tested" } else { $raw }
+            }
+            $result.notes = "$($data.notes)"
+            $result.mode  = "$($data.mode)"
+        }
+        else {
+            $result.mode = "Window closed without saving"
+        }
+    }
+    catch {
+        $result.mode = "Error: $($_.Exception.Message)"
+    }
+    finally {
+        if (Test-Path -LiteralPath $tmpJson) {
+            Remove-Item -LiteralPath $tmpJson -ErrorAction SilentlyContinue
+        }
+    }
+
+    return $result
+}
+
+function Get-AdrSha256Hex {
+    param([string]$Data)
+    $sha   = [System.Security.Cryptography.SHA256]::Create()
+    $bytes = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Data))
+    return -join ($bytes | ForEach-Object { $_.ToString("x2") })
+}
+
+function Get-AdrHmacSha256Bytes {
+    param([byte[]]$Key, [string]$Data)
+    $hmac = [System.Security.Cryptography.HMACSHA256]::new($Key)
+    return $hmac.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Data))
+}
+
+function Get-AdrSigV4SigningKey {
+    param([string]$Secret, [string]$DateStamp, [string]$Region, [string]$Service)
+    $kDate    = Get-AdrHmacSha256Bytes -Key ([System.Text.Encoding]::UTF8.GetBytes("AWS4$Secret")) -Data $DateStamp
+    $kRegion  = Get-AdrHmacSha256Bytes -Key $kDate   -Data $Region
+    $kService = Get-AdrHmacSha256Bytes -Key $kRegion -Data $Service
+    return      Get-AdrHmacSha256Bytes -Key $kService -Data "aws4_request"
+}
+
+function Send-AdrSesEmail {
+    param([string]$ReportPath, [string]$ComputerName, [string]$Timestamp)
+
+    $sesFrom   = [System.Environment]::GetEnvironmentVariable("ADR_SES_FROM_EMAIL")
+    $sesTo     = [System.Environment]::GetEnvironmentVariable("ADR_SES_TO_EMAIL")
+    $sesKey    = [System.Environment]::GetEnvironmentVariable("ADR_SES_AWS_ACCESS_KEY_ID")
+    $sesSecret = [System.Environment]::GetEnvironmentVariable("ADR_SES_AWS_SECRET_ACCESS_KEY")
+    $sesRegion = [System.Environment]::GetEnvironmentVariable("ADR_SES_AWS_REGION")
+    if ([string]::IsNullOrWhiteSpace($sesRegion)) { $sesRegion = "us-east-1" }
+
+    $missing = @()
+    if ([string]::IsNullOrWhiteSpace($sesFrom))   { $missing += "ADR_SES_FROM_EMAIL" }
+    if ([string]::IsNullOrWhiteSpace($sesTo))     { $missing += "ADR_SES_TO_EMAIL" }
+    if ([string]::IsNullOrWhiteSpace($sesKey))    { $missing += "ADR_SES_AWS_ACCESS_KEY_ID" }
+    if ([string]::IsNullOrWhiteSpace($sesSecret)) { $missing += "ADR_SES_AWS_SECRET_ACCESS_KEY" }
+    if ($missing.Count -gt 0) {
+        Write-Host "SES: skipped — configure $($missing -join ', ')"
+        return
+    }
+
+    $content = Get-Content -LiteralPath $ReportPath -Raw -ErrorAction SilentlyContinue
+    if ([string]::IsNullOrEmpty($content)) {
+        Write-Warning "SES: could not read report file."
+        return
+    }
+
+    $subject = "ADR Report: $ComputerName ($Timestamp)"
+    $bodyObj = [ordered]@{
+        FromEmailAddress = $sesFrom
+        Destination      = @{ ToAddresses = @($sesTo) }
+        Content          = @{
+            Simple = @{
+                Subject = @{ Data = $subject;  Charset = "UTF-8" }
+                Body    = @{ Text = @{ Data = $content; Charset = "UTF-8" } }
+            }
+        }
+    }
+    $payload = $bodyObj | ConvertTo-Json -Depth 10 -Compress
+
+    $now        = [DateTime]::UtcNow
+    $amzDate    = $now.ToString("yyyyMMddTHHmmssZ")
+    $dateStamp  = $now.ToString("yyyyMMdd")
+    $sesHost    = "email.$sesRegion.amazonaws.com"
+    $sesUri     = "/v2/email/outbound-emails"
+
+    $payloadHash   = Get-AdrSha256Hex -Data $payload
+    $canonHeaders  = "content-type:application/json`nhost:$sesHost`nx-amz-date:$amzDate`n"
+    $signedHeaders = "content-type;host;x-amz-date"
+    $canonReq      = "POST`n$sesUri`n`n$canonHeaders`n$signedHeaders`n$payloadHash"
+    $credScope     = "$dateStamp/$sesRegion/ses/aws4_request"
+    $crHash        = Get-AdrSha256Hex -Data $canonReq
+    $stringToSign  = "AWS4-HMAC-SHA256`n$amzDate`n$credScope`n$crHash"
+    $signingKey    = Get-AdrSigV4SigningKey -Secret $sesSecret -DateStamp $dateStamp -Region $sesRegion -Service "ses"
+    $hmacBytes     = Get-AdrHmacSha256Bytes -Key $signingKey -Data $stringToSign
+    $signature     = -join ($hmacBytes | ForEach-Object { $_.ToString("x2") })
+    $auth          = "AWS4-HMAC-SHA256 Credential=$sesKey/$credScope, SignedHeaders=$signedHeaders, Signature=$signature"
+
+    try {
+        $headers = @{
+            "Content-Type" = "application/json"
+            "X-Amz-Date"   = $amzDate
+            "Authorization" = $auth
+        }
+        Invoke-RestMethod -Method POST -Uri "https://$sesHost$sesUri" `
+            -Headers $headers -Body $payload -ErrorAction Stop | Out-Null
+        Write-Host "SES: report emailed successfully to $sesTo"
+    }
+    catch {
+        Write-Warning "SES: send failed — $($_.Exception.Message)"
+    }
+}
+
+function Get-AdrRootDriveAnomalies {
+    $drive = $env:SystemDrive
+    if ([string]::IsNullOrWhiteSpace($drive)) { $drive = "C:" }
+    $root  = "$drive\"
+
+    $normalDirs = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    @(
+        "Windows","Program Files","Program Files (x86)","ProgramData",
+        "Users",'$Recycle.Bin',"System Volume Information","Recovery",
+        "Documents and Settings","MSOCache","PerfLogs","OneDriveTemp",
+        "inetpub","AMD","NVIDIA","Intel","Logs",
+        "hp","Dell","Lenovo","Acer","ASUS","Microsoft",
+        "Packages","boot"
+    ) | ForEach-Object { $normalDirs.Add($_) | Out-Null }
+
+    $normalFiles = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    @(
+        "pagefile.sys","swapfile.sys","hiberfil.sys","bootmgr","BOOTNXT",
+        "boot.ini","autoexec.bat","config.sys","io.sys","msdos.sys","MSDOS.SYS",
+        "DumpStack.log","DumpStack.log.tmp"
+    ) | ForEach-Object { $normalFiles.Add($_) | Out-Null }
+
+    $anomalies = [System.Collections.Generic.List[string]]::new()
+    try {
+        foreach ($item in (Get-ChildItem -LiteralPath $root -Force -ErrorAction Stop)) {
+            if ($item.PSIsContainer) {
+                if (-not $normalDirs.Contains($item.Name)) {
+                    $anomalies.Add("DIR  $($item.Name)  [modified $($item.LastWriteTime.ToString('yyyy-MM-dd'))]")
+                }
+            }
+            else {
+                if (-not $normalFiles.Contains($item.Name)) {
+                    $kb = [Math]::Round($item.Length / 1024, 1)
+                    $anomalies.Add("FILE $($item.Name)  [$kb KB, modified $($item.LastWriteTime.ToString('yyyy-MM-dd'))]")
+                }
+            }
+        }
+    }
+    catch {
+        return "Unavailable: $($_.Exception.Message)"
+    }
+
+    if ($anomalies.Count -eq 0) { return "No unexpected items found at $root" }
+    return "Unexpected items at ${root}" + "`n" + ($anomalies -join "`n")
+}
+
+function Get-AdrRemoteAgents {
+    $pf   = $env:ProgramFiles;          if (-not $pf)   { $pf   = "C:\Program Files" }
+    $pf86 = ${env:ProgramFiles(x86)};   if (-not $pf86) { $pf86 = "C:\Program Files (x86)" }
+    $pd   = $env:ProgramData;           if (-not $pd)   { $pd   = "C:\ProgramData" }
+    $win  = $env:SystemRoot;            if (-not $win)  { $win  = "C:\Windows" }
+
+    $agentDefs = @(
+        [pscustomobject]@{ Name="ScreenConnect / ConnectWise Control"; Paths=@(
+            "$pf\ScreenConnect Client *\ScreenConnect.ClientService.exe"
+            "$pf86\ScreenConnect Client *\ScreenConnect.ClientService.exe"
+            "$pd\ScreenConnect Client *\ScreenConnect.ClientService.exe" )}
+        [pscustomobject]@{ Name="Atera Agent"; Paths=@(
+            "$pf\ATERA Networks\AteraAgent\AteraAgent.exe" )}
+        [pscustomobject]@{ Name="TeamViewer"; Paths=@(
+            "$pf\TeamViewer\TeamViewer.exe"
+            "$pf\TeamViewer\TeamViewer_Service.exe"
+            "$pf86\TeamViewer\TeamViewer.exe" )}
+        [pscustomobject]@{ Name="UltraViewer"; Paths=@(
+            "$pf\UltraViewer\UltraViewer_Desktop.exe"
+            "$pf86\UltraViewer\UltraViewer_Desktop.exe" )}
+        [pscustomobject]@{ Name="AnyDesk"; Paths=@(
+            "$pf\AnyDesk\AnyDesk.exe"
+            "$pf86\AnyDesk\AnyDesk.exe"
+            "$pd\AnyDesk\AnyDesk.exe" )}
+        [pscustomobject]@{ Name="RustDesk"; Paths=@(
+            "$pf\RustDesk\rustdesk.exe"
+            "$pf86\RustDesk\rustdesk.exe" )}
+        [pscustomobject]@{ Name="LogMeIn"; Paths=@(
+            "$pf\LogMeIn\x64\LogMeIn.exe"
+            "$pf86\LogMeIn\LogMeIn.exe" )}
+        [pscustomobject]@{ Name="Splashtop"; Paths=@(
+            "$pf\Splashtop\Splashtop Remote\Server\SRServer.exe"
+            "$pf86\Splashtop\Splashtop Remote\Server\SRServer.exe" )}
+        [pscustomobject]@{ Name="RemotePC"; Paths=@(
+            "$pf\RemotePC\RemotePC.exe"
+            "$pf86\RemotePC\RemotePC.exe" )}
+        [pscustomobject]@{ Name="NinjaOne / NinjaRMM Agent"; Paths=@(
+            "$pf\NinjaRMMAgent\ninjarmmagent.exe"
+            "$pf\NinjaOne\ninjarmmagent.exe" )}
+        [pscustomobject]@{ Name="Kaseya VSA Agent"; Paths=@(
+            "$pf\Kaseya\*\KaseyaAgent.exe"
+            "$pf86\Kaseya\*\KaseyaAgent.exe" )}
+        [pscustomobject]@{ Name="N-able / N-central Agent"; Paths=@(
+            "$pf\N-able Technologies\Windows Agent\bin\agent.exe"
+            "$pf86\N-able Technologies\Windows Agent\bin\agent.exe" )}
+        [pscustomobject]@{ Name="Datto RMM Agent (CentraStage)"; Paths=@(
+            "$pf\CentraStage\AemAgent\AemAgent.exe"
+            "$pf\Datto\RMM\*\AemAgent.exe" )}
+        [pscustomobject]@{ Name="Pulseway"; Paths=@(
+            "$pf\Pulseway\Pulseway.exe"
+            "$pf86\Pulseway\Pulseway.exe" )}
+        [pscustomobject]@{ Name="Supremo Remote Desktop"; Paths=@(
+            "$pf\Supremo\Supremo.exe"
+            "$pf86\Supremo\Supremo.exe" )}
+        [pscustomobject]@{ Name="Radmin Server"; Paths=@(
+            "$pf\Famatech\Remote Administrator Server\rserver30.exe"
+            "$pf86\Famatech\Remote Administrator Server\rserver30.exe" )}
+        [pscustomobject]@{ Name="RealVNC Server"; Paths=@(
+            "$pf\RealVNC\VNC Server\vncserver.exe"
+            "$pf86\RealVNC\VNC Server\vncserver.exe" )}
+        [pscustomobject]@{ Name="TightVNC Server"; Paths=@(
+            "$pf\TightVNC\tvnserver.exe"
+            "$pf86\TightVNC\tvnserver.exe" )}
+        [pscustomobject]@{ Name="UltraVNC Server"; Paths=@(
+            "$pf\UltraVNC\winvnc.exe"
+            "$pf86\UltraVNC\winvnc.exe" )}
+        [pscustomobject]@{ Name="TigerVNC Server"; Paths=@(
+            "$pf\TigerVNC\vncserver.exe" )}
+        [pscustomobject]@{ Name="BeyondTrust / Bomgar Jump Client"; Paths=@(
+            "$pf\Bomgar\*\bomgar-*.exe"
+            "$pf\BeyondTrust\Remote Support Jump Client\*\bomgar-*.exe" )}
+        [pscustomobject]@{ Name="DameWare Mini Remote Control"; Paths=@(
+            "$pf\SolarWinds\DameWare Mini Remote Control\DWRCC.exe"
+            "$pf86\SolarWinds\DameWare Mini Remote Control\DWRCC.exe"
+            "$pf\SolarWinds\DameWare Remote Support\DWRCCSvc.exe" )}
+        [pscustomobject]@{ Name="Zoho Assist"; Paths=@(
+            "$pf\Zoho\ZohoAssist\ZAService.exe"
+            "$pd\Zoho Corp\ZohoAssist\ZAService.exe" )}
+        [pscustomobject]@{ Name="ManageEngine UEMS / Remote Access Plus"; Paths=@(
+            "$pf\ManageEngine\UEMS_Agent\bin\dcagentservice.exe"
+            "$pf\ManageEngine\Remote Access Plus\bin\MERAP.exe" )}
+        [pscustomobject]@{ Name="Parsec"; Paths=@(
+            "$pf\Parsec\parsecd.exe" )}
+        [pscustomobject]@{ Name="MeshAgent (MeshCentral)"; Paths=@(
+            "$pf\Mesh Agent\MeshAgent.exe"
+            "C:\Windows\Mesh Agent\MeshAgent.exe" )}
+        [pscustomobject]@{ Name="Action1 RMM Agent"; Paths=@(
+            "$pf\Action1\Action1_Remote_Access.exe" )}
+        [pscustomobject]@{ Name="Tactical RMM Agent"; Paths=@(
+            "$pf\TacticalAgent\tacticalrmm.exe" )}
+        [pscustomobject]@{ Name="NetSupport Manager"; Paths=@(
+            "$pf\NetSupport\NetSupport Manager\client32.exe"
+            "$pf86\NetSupport\NetSupport Manager\client32.exe"
+            "$pf\NetSupport\NetSupport School\student32.exe" )}
+        [pscustomobject]@{ Name="Huntress Agent"; Paths=@(
+            "$pf\Huntress\HuntressAgent.exe" )}
+        [pscustomobject]@{ Name="Level RMM Agent"; Paths=@(
+            "$pf\Level\level-windows-amd64.exe"
+            "$pf\Level\level.exe" )}
+        [pscustomobject]@{ Name="ConnectWise Automate / LabTech Agent"; Paths=@(
+            "$win\LTSvc\ltsvc.exe"
+            "C:\Windows\LTSvc\ltsvc.exe" )}
+        [pscustomobject]@{ Name="Syncro RMM Agent"; Paths=@(
+            "$pf\Syncro\app\Syncro.App.Runner.exe" )}
+        [pscustomobject]@{ Name="ISL Online / ISL AlwaysOn"; Paths=@(
+            "$pd\ISL Online\ISLAlwaysOn-*.exe"
+            "$pf\ISL Online\ISLLight.exe" )}
+        [pscustomobject]@{ Name="DWService (DWAgent)"; Paths=@(
+            "$pf\DWAgent\dwagsvc.exe" )}
+        [pscustomobject]@{ Name="Remote Utilities Host"; Paths=@(
+            "$pf\Remote Utilities - Host\rutserv.exe"
+            "$pf86\Remote Utilities - Host\rutserv.exe" )}
+        [pscustomobject]@{ Name="SimpleHelp Remote Support"; Paths=@(
+            "$pf\SimpleHelp\remote\remote64.exe"
+            "$pf\SimpleHelp\remote\remote.exe" )}
+        [pscustomobject]@{ Name="Naverisk Agent"; Paths=@(
+            "$pf\Naverisk\Agent\NaveriskAgent.exe" )}
+        [pscustomobject]@{ Name="ImmyBot Agent"; Paths=@(
+            "$pf\ImmyBot\ImmyAgent.exe" )}
+        [pscustomobject]@{ Name="GoToMyPC"; Paths=@(
+            "$pf\GoTo\GoToMyPC\g2svc.exe"
+            "$pf\Citrix Online\GoToMyPC\g2svc.exe" )}
+        [pscustomobject]@{ Name="N-able Take Control Agent"; Paths=@(
+            "$pf\N-able Technologies\Take Control Agent\*\BASupportExpressNCST.exe"
+            "$pf86\N-able Technologies\Take Control Agent\*\BASupportExpressNCST.exe" )}
+        [pscustomobject]@{ Name="Ammyy Admin"; Paths=@(
+            "$pf\Ammyy Admin\AA_v3.exe"
+            "$pf86\Ammyy Admin\AA_v3.exe"
+            "C:\Ammyy\AA_v3.exe" )}
+        [pscustomobject]@{ Name="FixMe.IT Agent"; Paths=@(
+            "$pf\FixMe.IT\FixMeIT.exe" )}
+        [pscustomobject]@{ Name="HelpWire"; Paths=@(
+            "$pf\HelpWire\HelpWireHost.exe" )}
+        [pscustomobject]@{ Name="Citrix Virtual Apps/Desktops VDA"; Paths=@(
+            "$pf\Citrix\ICAService\CtxSvcHost.exe" )}
+        [pscustomobject]@{ Name="GoTo Resolve / GoTo Assist"; Paths=@(
+            "$pf\GoTo\GoToResolve\GoToResolveAgent.exe"
+            "$pf\GoTo\GoToAssist\GoToAssistAgentSvc.exe" )}
+        [pscustomobject]@{ Name="Freshdesk / Freshservice Agent"; Paths=@(
+            "$pf\Freshworks\Freshservice Device Agent\FreshserviceAgent.exe" )}
+    )
+
+    $sha256   = [System.Security.Cryptography.SHA256]::Create()
+    $found    = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($def in $agentDefs) {
+        foreach ($pat in $def.Paths) {
+            $hits = @()
+            try {
+                $hits = @(Get-Item -Path $pat -Force -ErrorAction SilentlyContinue)
+                if ($hits.Count -eq 0 -and $pat -match '\*') {
+                    $hits = @(Get-ChildItem -Path $pat -Force -ErrorAction SilentlyContinue)
+                }
+            } catch {}
+            foreach ($f in $hits) {
+                if ($f.PSIsContainer) { continue }
+                try {
+                    $bytes   = [System.IO.File]::ReadAllBytes($f.FullName)
+                    $hashHex = -join ($sha256.ComputeHash($bytes) | ForEach-Object { $_.ToString("x2") })
+                } catch {
+                    $hashHex = "hash-unavailable"
+                }
+                $found.Add("  $($def.Name)")
+                $found.Add("    Path:    $($f.FullName)")
+                $found.Add("    SHA-256: $hashHex")
+            }
+        }
+    }
+
+    # Service-name sweep for agents that may live in non-standard paths
+    $svcPatterns = @(
+        "TeamViewer","AnyDesk","RustDesk","ScreenConnect","AteraAgent",
+        "SRService","SplashtopBusiness","LogMeIn","parsecd","ninjarmmagent",
+        "dwagsvc","MeshAgent","HuntressAgent","HuntressTray","ZohoAssist",
+        "isllight","ISLAlwaysOn","ltsvc","Pulseway","pwdaemon","Supremo",
+        "tvnserver","winvnc","vncserver","rserver30","DWRCC","bomgar",
+        "TacticalRMM","client32","Level","Syncro","naverisk","ImmyAgent",
+        "action1","rutserv","BASupportExpressNCST","NetSupportServer",
+        "GoToAssist","GoToResolve","RemotePC","FreshserviceAgent"
+    )
+    $svcHits = [System.Collections.Generic.List[string]]::new()
+    try {
+        foreach ($svc in (Get-Service -ErrorAction SilentlyContinue)) {
+            foreach ($pat in $svcPatterns) {
+                if ($svc.Name -like "*$pat*" -or $svc.DisplayName -like "*$pat*") {
+                    $svcHits.Add("  $($svc.DisplayName) [$($svc.Status)] (service name: $($svc.Name))")
+                    break
+                }
+            }
+        }
+    } catch {}
+
+    if ($found.Count -eq 0 -and $svcHits.Count -eq 0) {
+        return "No known remote access agents detected in standard install locations or services"
+    }
+
+    $out = [System.Collections.Generic.List[string]]::new()
+    if ($found.Count -gt 0) {
+        $out.Add("Installed agent executables found (with SHA-256):")
+        $out.AddRange($found)
+    }
+    if ($svcHits.Count -gt 0) {
+        if ($out.Count -gt 0) { $out.Add("") }
+        $out.Add("Agent-related Windows services detected:")
+        $out.AddRange($svcHits)
+    }
+    return $out -join "`n"
+}
+
 $envFileStatus = Import-AdrEnvFile -RequestedPath $EnvFile
 $outputDirectoryPath = Resolve-AdrOutputDirectory -RequestedDirectory $OutputDirectory
 $computerName = First-AdrNonBlank @($env:COMPUTERNAME, "UNKNOWN")
@@ -1293,6 +1740,29 @@ $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $outputFile = Join-Path $outputDirectoryPath "ADR-$hostSafe-$timestamp.txt"
 $generatedAt = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss zzz")
 $isAdmin = Test-AdrAdmin
+
+$skipManualEnv = ([System.Environment]::GetEnvironmentVariable("ADR_SKIP_MANUAL_CHECKS") -eq "true")
+$manualChecks  = Invoke-AdrManualGui -Skip $SkipManualChecks.IsPresent -SkipFromEnv $skipManualEnv `
+                                     -HostName $computerName -Timestamp $timestamp
+
+# ── Root drive anomaly check (always runs, lightweight) ────────────────────────
+$rootDriveAnomalies = Get-AdrRootDriveAnomalies
+
+# ── Remote agent scan (optional — Y/N prompt unless skipped by flag or env) ────
+$skipAgentEnv    = ([System.Environment]::GetEnvironmentVariable("ADR_SKIP_AGENT_SCAN") -eq "true")
+$remoteAgentData = "Scan skipped"
+if (-not $SkipAgentScan.IsPresent -and -not $skipAgentEnv) {
+    Write-Host ""
+    Write-Host "Run remote access agent scan? (searches Program Files + services for known agents, computes SHA-256) [Y/n]: " -NoNewline
+    try { $agentAns = [Console]::ReadLine() } catch { $agentAns = "y" }
+    if ([string]::IsNullOrWhiteSpace($agentAns) -or $agentAns -match "^[Yy]") {
+        Write-Host "Scanning for remote access agents..."
+        $remoteAgentData = Get-AdrRemoteAgents
+    }
+}
+elseif ($SkipAgentScan.IsPresent -or $skipAgentEnv) {
+    $remoteAgentData = "Scan skipped (ADR_SKIP_AGENT_SCAN or -SkipAgentScan flag)"
+}
 
 $computerSystem = @(Get-AdrCim -ClassName Win32_ComputerSystem) | Select-Object -First 1
 $bios = @(Get-AdrCim -ClassName Win32_BIOS) | Select-Object -First 1
@@ -1552,6 +2022,8 @@ $facts = [ordered]@{
     MicrophoneUsage = $microphoneUsage
     CameraUsage = $cameraUsage
     TPM = $tpmStatus
+    RootDriveAnomalies = $rootDriveAnomalies
+    RemoteAgents = $remoteAgentData
 }
 
 $aiResult = $null
@@ -1604,18 +2076,19 @@ Add-AdrLine "Admin / BIOS Password Provided: Manual Check Required (do not colle
 Add-AdrLine ""
 Add-AdrLine "Display & Visuals"
 Add-AdrLine ""
-Add-AdrLine "Display Intact/No Cracks: Manual Check Required"
-Add-AdrLine "Backlight Functional/Even: Manual Check Required"
-Add-AdrLine "Touch Screen Responsive: Manual Check Required (detected: $touchDetection)"
-Add-AdrLine "External Video Output OK: Manual Check Required (detected display/video: $displayDetection)"
+Add-AdrLine "Display Intact/No Cracks (manual): $($manualChecks.display)"
+Add-AdrLine "Touch Screen Responsive (manual): $($manualChecks.touch_screen) (detected: $touchDetection)"
+Add-AdrLine "External Video Output OK (detected): $displayDetection"
 Add-AdrLine ""
 Add-AdrLine "Input & Peripheral Health"
 Add-AdrLine ""
-Add-AdrLine "Keyboard Working: Manual Check Required (detected: $keyboardDetection)"
-Add-AdrLine "Trackpad Working: Manual Check Required (detected: $trackpadDetection)"
-Add-AdrLine "Webcam Working: Manual Check Required (detected: $webcamDetection)"
+Add-AdrLine "Keyboard Working (manual): $($manualChecks.keyboard) (detected: $keyboardDetection)"
+Add-AdrLine "Trackpad Working (manual): $($manualChecks.trackpad) (detected: $trackpadDetection)"
+Add-AdrLine "Webcam Working (manual): $($manualChecks.webcam) (detected: $webcamDetection)"
 Add-AdrLine "Internet/WiFi Working: $networkSummary"
-Add-AdrLine "Speakers/Mic Working: Manual Check Required (detected: $audioDetection; usage: $microphoneUsage)"
+Add-AdrLine "Left Speaker Working (manual): $($manualChecks.left_speaker)"
+Add-AdrLine "Right Speaker Working (manual): $($manualChecks.right_speaker)"
+Add-AdrLine "Microphone Working (manual): $($manualChecks.microphone) (usage: $microphoneUsage)"
 Add-AdrLine ""
 Add-AdrLine "Power & Thermal Stats"
 Add-AdrLine ""
@@ -1694,12 +2167,32 @@ Add-AdrLine "Audio Detection: $audioDetection"
 Add-AdrLine "Microphone Privacy Usage: $microphoneUsage"
 
 Add-AdrSection "Manual Checks Required"
+Add-AdrLine "Manual Check Mode: $($manualChecks.mode)"
+Add-AdrLine ""
+Add-AdrLine "Hardware Tests"
+Add-AdrLine "Display (no cracks, backlight even): $($manualChecks.display)"
+Add-AdrLine "Touch Screen: $($manualChecks.touch_screen)"
+Add-AdrLine "Keyboard (all keys responding): $($manualChecks.keyboard)"
+Add-AdrLine "Trackpad / Pointing Device: $($manualChecks.trackpad)"
+Add-AdrLine "Left Speaker: $($manualChecks.left_speaker)"
+Add-AdrLine "Right Speaker: $($manualChecks.right_speaker)"
+Add-AdrLine "Microphone: $($manualChecks.microphone)"
+Add-AdrLine "Webcam (live image visible): $($manualChecks.webcam)"
+if (-not [string]::IsNullOrWhiteSpace($manualChecks.notes)) {
+    Add-AdrLine "Technician Notes: $($manualChecks.notes)"
+}
+Add-AdrLine ""
+Add-AdrLine "Physical Inspection (fill in manually)"
 Add-AdrLine "Estimated device value and device age confirmation"
-Add-AdrLine "Display glass, panel damage, backlight evenness, and external display output"
-Add-AdrLine "Keyboard, trackpad, touchscreen, webcam, speakers, and microphone functional testing"
 Add-AdrLine "DC jack/USB-C port tightness, charger compatibility, liquid damage, dust, dents, and missing screws"
 Add-AdrLine "Admin/BIOS password availability without recording the password"
 Add-AdrLine "Previous repair evidence, initial issue, secondary risks, and parts/labor quote"
+
+Add-AdrSection "Root Drive / Filesystem Anomalies"
+Add-AdrLine $rootDriveAnomalies
+
+Add-AdrSection "Remote Access Agents"
+Add-AdrLine $remoteAgentData
 
 if ($UseAiEnrichment) {
     Add-AdrSection "AI Research Suggestions"
@@ -1711,4 +2204,8 @@ if ($UseAiEnrichment) {
 
 Set-Content -LiteralPath $outputFile -Value $reportLines -Encoding UTF8
 Write-Host "Diagnostic report written to: $outputFile"
+
+if ([System.Environment]::GetEnvironmentVariable("ADR_SES_ENABLED") -eq "true") {
+    Send-AdrSesEmail -ReportPath $outputFile -ComputerName $computerName -Timestamp $timestamp
+}
 
